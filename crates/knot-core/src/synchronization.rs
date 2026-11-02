@@ -12,6 +12,13 @@ pub struct ReferenceUpdate {
 }
 
 impl<B: Backend> Repository<B> {
+    pub(crate) fn check_reference_name(&self, name: &str) -> Result<()> {
+        let mut names: BTreeSet<_> = self.backend.list_meta("refs/")?.into_iter().collect();
+        names.insert(name.into());
+        validate_path_set(names.iter().map(String::as_str))
+            .map_err(|e| Error::Conflict(format!("conflicting reference names: {e}")))
+    }
+
     pub fn reference_inventory(&self) -> Result<BTreeMap<String, ObjectId>> {
         self.ensure_ready()?;
         self.backend

@@ -60,7 +60,7 @@ completed stage. The product is CLI-only; the previously proposed hosting/React 
 
 ## Verification record
 
-All 84 automated tests pass on Linux, including a two-repository 18 MiB transfer,
+All 94 automated tests pass on Linux, including a two-repository 18 MiB transfer,
 manual evidence/release restoration, override history, MCP write authorization,
 stale-preview rejection, SSH endpoint uploads/downloads, ref conflicts, and crash
 recovery. Rustfmt, Clippy with warnings denied, and the locked workspace build
@@ -68,6 +68,11 @@ pass. All-targets compile checks pass for Windows GNU and macOS ARM; native
 runtime coverage for those systems belongs to the CI matrix. Direct dependency
 versions were rechecked against crates.io; no newer stable versions or compatible
 lockfile updates were found. Skills passed the bundled skill validator.
+
+Regressions for GitHub issues #1–#5 cover interrupted uploads/downloads at every
+complete frame boundary, killed receivers and retry, incomplete object graphs,
+release/branch selector collisions, MCP branch/detached-HEAD changes, portable ref
+directory spellings, and edit/revert restoration of revisions and test evidence.
 
 Live LAN multicast, internet SSH, and Tailscale account/VPN connectivity were not
 exercised against external devices. Those require real network access and

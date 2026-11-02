@@ -147,12 +147,14 @@ impl FsBackend {
                 "unsupported repository format or hash algorithm".into(),
             ));
         }
-        Ok(Self {
+        let backend = Self {
             root,
             meta,
             config,
             _lock: lock,
-        })
+        };
+        backend.recover_incoming_objects()?;
+        Ok(backend)
     }
     pub(crate) fn ensure_m2_format(&self) -> Result<()> {
         self.ensure_format(2)
@@ -332,7 +334,15 @@ pub(crate) fn checked_join(base: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn validate_meta_name(name: &str) -> Result<()> {
-    if ["HEAD", "index", "config.toml", "transaction.json"].contains(&name) {
+    if [
+        "HEAD",
+        "index",
+        "config.toml",
+        "transaction.json",
+        "incoming.json",
+    ]
+    .contains(&name)
+    {
         return Ok(());
     }
     for prefix in [

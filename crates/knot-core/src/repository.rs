@@ -465,22 +465,29 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn resolve(&self, target: &str) -> Result<ObjectId> {
+        Ok(self.resolve_checkout_target(target)?.0)
+    }
+
+    // Keep the selected namespace with the commit; selectors such as release/v1
+    // take precedence over a same-spelled branch and must detach HEAD.
+    fn resolve_checkout_target(&self, target: &str) -> Result<(ObjectId, Option<String>)> {
         if let Some(name) = target.strip_prefix("release/") {
             validate_ref_name(name)?;
             let text = self
                 .backend
                 .read_meta(&format!("refs/releases/{name}"))?
                 .ok_or_else(|| Error::NotFound(format!("release {name}")))?;
-            return Ok(self.load::<Release>(&parse_pointer(&text)?)?.commit);
+            return Ok((self.load::<Release>(&parse_pointer(&text)?)?.commit, None));
         }
         if target == "HEAD" {
-            return self
+            let id = self
                 .head_id()?
-                .ok_or_else(|| Error::NotFound("HEAD has no commit".into()));
+                .ok_or_else(|| Error::NotFound("HEAD has no commit".into()))?;
+            return Ok((id, self.head_ref()?));
         }
         if let Ok(id) = target.parse::<ObjectId>() {
             self.load::<Commit>(&id)?;
-            return Ok(id);
+            return Ok((id, None));
         }
         validate_ref_name(target)?;
         let mut found = Vec::new();
@@ -488,7 +495,10 @@ impl<B: Backend> Repository<B> {
             if let Some(text) = self.backend.read_meta(&format!("{prefix}/{target}"))? {
                 let id = parse_pointer(&text)?;
                 self.load::<Commit>(&id)?;
-                found.push(id);
+                found.push((
+                    id,
+                    (prefix == "refs/heads").then(|| format!("{prefix}/{target}")),
+                ));
             }
         }
         match found.len() {
@@ -529,6 +539,7 @@ impl<B: Backend> Repository<B> {
             }
         }
         let key = format!("refs/{}/{name}", if tag { "tags" } else { "heads" });
+        self.check_reference_name(&key)?;
         let mut tx = Transaction::new(if tag { "tag" } else { "branch" });
         tx.metadata
             .push(self.meta_change(&key, Some(pointer(&id)))?);
@@ -700,7 +711,7 @@ impl<B: Backend> Repository<B> {
                 "checkout requires a clean staging area and tracked working tree".into(),
             ));
         }
-        let commit = self.resolve(target)?;
+        let (commit, branch) = self.resolve_checkout_target(target)?;
         let snapshot = self.load::<Commit>(&commit)?.snapshot;
         if !allow_incompatible {
             self.require_satisfied(&snapshot)?;
@@ -710,21 +721,15 @@ impl<B: Backend> Repository<B> {
         self.check_destinations(&before, &after)?;
         let mut tx = Transaction::new("checkout");
         tx.files = self.tree_file_changes(&before, &after)?;
-        let branch = format!("refs/heads/{target}");
-        let is_branch = target != "HEAD"
-            && target.parse::<ObjectId>().is_err()
-            && self.backend.read_meta(&branch)?.is_some();
-        let head = if is_branch {
+        let head = if let Some(branch) = &branch {
             format!("ref: {branch}\n")
-        } else if target == "HEAD" {
-            self.head_value()?
         } else {
             pointer(&commit)
         };
         tx.metadata
             .push(self.meta_change("index", Some(pointer(&snapshot)))?);
         tx.metadata.push(self.meta_change("HEAD", Some(head))?);
-        if is_branch {
+        if let Some(branch) = branch {
             tx.metadata
                 .push(self.meta_change(&branch, Some(pointer(&commit)))?);
         }
@@ -1087,6 +1092,7 @@ impl<B: Backend> Repository<B> {
             self.load::<Commit>(&head)?;
         }
         let refs = self.backend.list_meta("refs/")?;
+        validate_path_set(refs.iter().map(String::as_str))?;
         for name in &refs {
             let text = self
                 .backend

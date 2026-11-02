@@ -42,7 +42,9 @@ impl Transaction {
 
 impl<B: Backend> Repository<B> {
     pub(crate) fn ensure_ready(&self) -> Result<()> {
-        if self.backend.read_meta("transaction.json")?.is_some() {
+        if self.backend.read_meta("transaction.json")?.is_some()
+            || self.backend.read_meta("incoming.json")?.is_some()
+        {
             return Err(Error::Pending);
         }
         Ok(())

@@ -48,6 +48,133 @@ fn human(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn release_checkout_preserves_a_same_spelled_branch() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init"]);
+    fs::write(root.join("part"), "A").unwrap();
+    ok(root, &["add", "."]);
+    ok(root, &["commit", "-m", "Initial"]);
+    let first = ok(root, &["status"])["head"].clone();
+    ok(root, &["release", "create", "v1", "--approver", "Engineer"]);
+    fs::write(root.join("part"), "B").unwrap();
+    ok(root, &["add", "."]);
+    ok(root, &["commit", "-m", "Newer"]);
+    ok(root, &["branch", "release/v1"]);
+    let branches = ok(root, &["branch"]);
+    ok(root, &["checkout", "release/v1"]);
+    let status = ok(root, &["status"]);
+    assert!(status["branch"].is_null());
+    assert_eq!(status["head"], first);
+    assert_eq!(ok(root, &["branch"]), branches);
+    assert_eq!(fs::read(root.join("part")).unwrap(), b"A");
+}
+
+#[test]
+fn killed_uploads_recover_on_open_and_push_retries_without_losing_existing_objects() {
+    use knot_core::{Backend, Repository};
+    use knot_store::{FsBackend, push, remote_add};
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let dir = tempdir().unwrap();
+    let source =
+        Repository::open(FsBackend::init(dir.path().join("source"), None).unwrap()).unwrap();
+    source.write_asset("part", b"transfer contents").unwrap();
+    source.commit("Initial").unwrap();
+    let ids = source.backend().list_objects().unwrap();
+    let frames = ids
+        .iter()
+        .map(|id| json!({"id":id,"len":source.backend().object_size(id).unwrap()}))
+        .collect::<Vec<_>>();
+    let updates = source
+        .reference_inventory()
+        .unwrap()
+        .into_iter()
+        .map(|(name, after)| json!({"name":name,"before":null,"after":after}))
+        .collect::<Vec<_>>();
+    for count in 1..ids.len() {
+        let peer_path = dir.path().join(format!("peer-{count}"));
+        let peer = FsBackend::init_bare(&peer_path, None).unwrap();
+        let retained = peer
+            .put_object(knot_core::ObjectKind::Blob, b"retained orphan")
+            .unwrap();
+        let existing = peer.list_objects().unwrap();
+        drop(peer);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+            .arg("-C")
+            .arg(&peer_path)
+            .args(["serve", "--stdio", "--allow-writes"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        writeln!(
+            input,
+            "{}",
+            json!({"operation":"put","objects":frames,"updates":updates})
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["data"]["ready"],
+            true
+        );
+        for id in &ids[..count] {
+            source.backend().export_object(id, &mut input).unwrap();
+        }
+        input.flush().unwrap();
+        let object_paths = ids[..count]
+            .iter()
+            .map(|id| {
+                let id = id.as_str();
+                peer_path
+                    .join(".knot/objects/sha256")
+                    .join(&id[..2])
+                    .join(&id[2..])
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !peer_path.join(".knot/incoming.json").exists()
+            || object_paths.iter().any(|path| !path.exists())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "receiver did not import complete frame"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Abrupt termination skips ObjectImport::drop, exercising the persisted
+        // rollback record rather than ordinary EOF/error cleanup.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(input);
+        assert!(peer_path.join(".knot/incoming.json").exists());
+        ok(&peer_path, &["fsck"]);
+        let peer = Repository::open(FsBackend::open(&peer_path).unwrap()).unwrap();
+        assert_eq!(peer.backend().list_objects().unwrap(), existing);
+        assert!(peer.head_id().unwrap().is_none());
+        assert_eq!(
+            peer.backend().get_object(&retained).unwrap().1,
+            b"retained orphan"
+        );
+        drop(peer);
+        let name = format!("peer-{count}");
+        remote_add(&source, &name, peer_path.to_str().unwrap()).unwrap();
+        push(&source, &name, None).unwrap();
+        let peer = Repository::open(FsBackend::open(&peer_path).unwrap()).unwrap();
+        assert_eq!(peer.head_id().unwrap(), source.head_id().unwrap());
+        peer.fsck().unwrap();
+    }
+}
+
+#[test]
 fn override_guards_are_per_dependency_and_commit_history_marks_accepted_overrides() {
     use std::io::Write;
     use std::process::Stdio;

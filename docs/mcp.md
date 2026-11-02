@@ -30,7 +30,10 @@ Mutating tools default to preview. A preview returns `expected_snapshot`,
 `expected_head`, `expected_worktree`, and `expected_refs`. To apply, repeat the operation arguments
 with `apply: true` and all four expected values, including a null HEAD before the
 first commit. The server must also have been started with `--allow-writes`.
-Changed working bytes, staging, HEAD, or any reference (including reviews and fetched history) invalidate the preview. Core dirty-file,
+Changed working bytes, staging, HEAD, or any reference (including reviews and
+fetched history) invalidate the preview. `expected_refs` also covers the exact
+symbolic/detached HEAD metadata: switching branches at the same commit still
+requires a new preview. Core dirty-file,
 dependency, integrity, recovery, and release policy checks remain enforced.
 
 `knot_run_validation` records a manual test execution; it never claims that an

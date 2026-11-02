@@ -204,7 +204,9 @@ fn check_remote_name(name: &str) -> Result<()> {
     Ok(())
 }
 fn ensure_ready(repo: &Repository<FsBackend>) -> Result<()> {
-    if repo.backend().read_meta("transaction.json")?.is_some() {
+    if repo.backend().read_meta("transaction.json")?.is_some()
+        || repo.backend().read_meta("incoming.json")?.is_some()
+    {
         return Err(Error::Pending);
     }
     Ok(())
@@ -342,9 +344,11 @@ impl Connection {
     ) -> Result<()> {
         match self {
             Self::Local(source) => {
+                let batch = crate::objects::ObjectImport::begin(destination, objects)?;
                 for id in objects {
                     copy_object(source, destination, id)?;
                 }
+                batch.finish()
             }
             Self::Ssh { input, output, .. } => {
                 send(
@@ -353,20 +357,9 @@ impl Connection {
                         objects: objects.to_vec(),
                     },
                 )?;
-                let frames: Vec<ObjectFrame> = serde_json::from_value(reply(output)?)?;
-                if frames.iter().map(|f| &f.id).ne(objects.iter()) {
-                    return Err(Error::Integrity(
-                        "object response differs from request".into(),
-                    ));
-                }
-                for frame in frames {
-                    destination
-                        .backend()
-                        .import_object(&frame.id, frame.len, output)?;
-                }
+                receive_download(destination, objects, output)
             }
         }
-        Ok(())
     }
     fn upload(
         &mut self,
@@ -376,9 +369,11 @@ impl Connection {
     ) -> Result<()> {
         match self {
             Self::Local(destination) => {
+                let batch = crate::objects::ObjectImport::begin(destination, objects)?;
                 for id in objects {
                     copy_object(source, destination, id)?;
                 }
+                batch.finish()?;
                 destination.publish_references(updates, None, true)?;
             }
             Self::Ssh { input, output, .. } => {
@@ -427,6 +422,38 @@ fn copy_object(
     let len = source.backend().object_size(id)?;
     let mut file = File::open(source.backend().object_path(id)?)?;
     destination.backend().import_object(id, len, &mut file)
+}
+
+fn receive_download(
+    destination: &Repository<FsBackend>,
+    objects: &[ObjectId],
+    input: &mut impl BufRead,
+) -> Result<()> {
+    let frames: Vec<ObjectFrame> = serde_json::from_value(reply(input)?)?;
+    if frames.iter().map(|f| &f.id).ne(objects.iter()) {
+        return Err(Error::Integrity(
+            "object response differs from request".into(),
+        ));
+    }
+    import_frames(destination, &frames, input)
+}
+
+fn import_frames(
+    destination: &Repository<FsBackend>,
+    frames: &[ObjectFrame],
+    input: &mut impl Read,
+) -> Result<()> {
+    let ids = frames
+        .iter()
+        .map(|frame| frame.id.clone())
+        .collect::<Vec<_>>();
+    let batch = crate::objects::ObjectImport::begin(destination, &ids)?;
+    for frame in frames {
+        destination
+            .backend()
+            .import_object(&frame.id, frame.len, input)?;
+    }
+    batch.finish()
 }
 fn send<T: Serialize>(out: &mut impl Write, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
@@ -522,9 +549,7 @@ pub fn serve_repository(
                         return Err(Error::Invalid("duplicate upload frames".into()));
                     }
                     success(out, serde_json::json!({"ready":true}))?;
-                    for frame in objects {
-                        repo.backend().import_object(&frame.id, frame.len, input)?;
-                    }
+                    import_frames(repo, &objects, input)?;
                     repo.publish_references(&updates, None, true)?;
                     success(out, serde_json::json!({"published":updates.len()}))
                 }
@@ -708,8 +733,65 @@ pub fn clone_repository(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_downloads_roll_back_every_frame_boundary_and_fetch_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("source");
+        let source = Repository::open(FsBackend::init(&source_path, None).unwrap()).unwrap();
+        source.write_asset("part", b"new part").unwrap();
+        let head = source.commit("Source").unwrap();
+        let objects = source.backend().list_objects().unwrap();
+        let frames = objects
+            .iter()
+            .map(|id| ObjectFrame {
+                id: id.clone(),
+                len: source.backend().object_size(id).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        let mut boundaries = vec![0];
+        for id in &objects {
+            source.backend().export_object(id, &mut bytes).unwrap();
+            boundaries.push(bytes.len());
+        }
+        drop(source);
+        for (number, boundary) in boundaries[..objects.len()].iter().enumerate() {
+            let path = root.path().join(format!("copy-{number}"));
+            let repo = Repository::open(FsBackend::init(&path, None).unwrap()).unwrap();
+            repo.write_asset("local", b"preserved history").unwrap();
+            let local_head = repo.commit("Local").unwrap();
+            let existing = repo.backend().list_objects().unwrap();
+            let refs = repo.reference_inventory().unwrap();
+            let mut stream = Vec::new();
+            success(&mut stream, &frames).unwrap();
+            stream.extend_from_slice(&bytes[..*boundary]);
+            let error =
+                receive_download(&repo, &objects, &mut std::io::Cursor::new(stream)).unwrap_err();
+            assert!(
+                error.to_string().contains("truncated object transfer"),
+                "{error}"
+            );
+            assert_eq!(repo.backend().list_objects().unwrap(), existing);
+            assert_eq!(repo.reference_inventory().unwrap(), refs);
+            assert!(repo.backend().read_meta("incoming.json").unwrap().is_none());
+            repo.fsck().unwrap();
+            remote_add(&repo, "origin", source_path.to_str().unwrap()).unwrap();
+            assert!(fetch(&repo, "origin").unwrap().objects > 0);
+            assert_eq!(
+                repo.backend()
+                    .read_meta("refs/remotes/origin/main")
+                    .unwrap(),
+                Some(format!("{head}\n"))
+            );
+            assert_eq!(repo.head_id().unwrap(), Some(local_head));
+            assert_eq!(fs::read(path.join("local")).unwrap(), b"preserved history");
+            repo.fsck().unwrap();
+        }
+    }
+
     #[test]
     fn ssh_addresses_are_data_and_shell_paths_are_quoted() {
         assert_eq!(

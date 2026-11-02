@@ -62,7 +62,11 @@ branch is refused; push to a bare peer or another branch instead.
 
 Exclusive OS locks, expected ref values, and the existing journal protect ref and
 working-file publication. Interrupted publication uses `recover --continue` or
-`--abort`. Verified objects may remain after a refused ref update; no history is
+`--abort`. Interrupted object transfers roll back newly imported objects using a
+durable `incoming.json` record; after a killed process, the next repository open
+performs this rollback automatically. Existing history and refs are preserved.
+Retry the original push or fetch normally. Complete, graph-verified batches may
+remain after a refused ref update; no history is
 silently lost. All missing objects are exchanged, including retained orphan
 objects; reachable-only packs, chunk deduplication, quotas, and partial clone are
 future optimizations.

@@ -18,6 +18,7 @@ All format rules are shared across adapters. Unsupported repository versions, ob
   refs/remotes/<peer>/<branch> # fetched commit pointer
   remotes/<peer>              # local URL configuration, not exchanged
   transaction.json          # present only during a pending transaction
+  incoming.json             # new object IDs for rollback of an incomplete import
   logs/<transaction-uuid>.json
   locks/repository          # OS lock handle, not a PID or stale-lock marker
   cache/                    # disposable; currently unused
@@ -25,7 +26,7 @@ All format rules are shared across adapters. Unsupported repository versions, ob
 
 Initialization temporarily uses root `.knot-init-*` directories; these are reserved metadata and excluded from worktree scans. If initialization is killed before publication, an abandoned staging directory can be removed while no initializer is running.
 
-Object IDs are exactly 64 lowercase hexadecimal characters. Pointer files contain the ID followed by exactly one LF. Symbolic HEAD contains `ref: refs/heads/<name>` followed by LF. An unborn branch has no branch ref yet. Branch/tag names are validated portable paths; HEAD, dot-prefixed components, `.lock` suffixes, `..`, `@`, and 64-character names are rejected. Command-created branch/tag names must not collide by case folding or directory prefix.
+Object IDs are exactly 64 lowercase hexadecimal characters. Pointer files contain the ID followed by exactly one LF. Symbolic HEAD contains `ref: refs/heads/<name>` followed by LF. An unborn branch has no branch ref yet. Branch/tag names are validated portable paths; HEAD, dot-prefixed components, `.lock` suffixes, `..`, `@`, and 64-character names are rejected. All reference sets must have consistently spelled directory components and avoid case-folded file/directory collisions. Creation and synchronization enforce these rules; fsck detects violations.
 
 ## Envelope and hashing
 
@@ -167,3 +168,11 @@ fast-forward-only, with immutable tags/releases. Bare HEAD branches advance thei
 index without materializing files; working peers require a guarded checkout.
 Local `remotes/<name>` JSON contains only `{url}` and remains outside transferred
 history. OpenSSH or optional Tailscale SSH carries the same byte protocol.
+
+Before an incoming batch writes objects, `incoming.json` records
+`{version: 1, objects: [object_id]}` with only IDs absent from the locked store.
+Individual envelopes are verified before installation. Failure rolls back those
+new objects; opening the backend automatically repeats rollback after a crash.
+The rollback record is removed durably only after the complete graph passes
+fsck, before any ref transaction begins. Preexisting objects are never removed.
+This local recovery metadata changes no object schema or wire protocol.

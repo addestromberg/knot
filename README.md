@@ -41,7 +41,7 @@ knot checkout v1.0
 knot fsck
 ```
 
-`branch` creates a branch without switching. Branch checkout attaches `HEAD`; tags and full commit IDs detach it. Tags cannot be overwritten. `log --target v1.0 path` can inspect a path present in an older state. Commits record the staged state, even when working files have further edits. Unchanged commits are rejected.
+`branch` creates a branch without switching. Branch checkout attaches `HEAD`; tags, releases, and full commit IDs detach it. `release/<name>` selects the release even if a branch has the same spelling, and preserves that branch. Tags cannot be overwritten. `log --target v1.0 path` can inspect a path present in an older state. Commits record the staged state, even when working files have further edits. Unchanged commits are rejected.
 
 Working directories contain one selected revision per tracked asset at its normal pathname, such as `mechanical/pipe.step`. Historical revisions stay in `.knot/objects/`; Knot does not create `pipe_R1.step`, `pipe_R2.step`, or parallel revision directories. Checkout replaces the selected tracked contents and applies recorded renames/deletions, while protecting local modifications and untracked files. Intentional copies are separate assets.
 

@@ -3,12 +3,82 @@ use knot_core::{
     Error, ObjectId, ObjectKind, Result, object_header, object_header_versioned,
     object_id_versioned,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
+
+/// Objects absent before an incoming batch. Persist this before publishing any
+/// frame, so an interrupted batch can be rolled back while holding the lock.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingObjects {
+    version: u32,
+    objects: Vec<ObjectId>,
+}
+
+pub(crate) struct ObjectImport<'a> {
+    repository: &'a knot_core::Repository<FsBackend>,
+    complete: bool,
+}
+
+impl<'a> ObjectImport<'a> {
+    pub(crate) fn begin(
+        repository: &'a knot_core::Repository<FsBackend>,
+        objects: &[ObjectId],
+    ) -> Result<Self> {
+        let backend = repository.backend();
+        if backend.read_metadata("incoming.json")?.is_some()
+            || backend.read_metadata("transaction.json")?.is_some()
+        {
+            return Err(Error::Pending);
+        }
+        // Include only newly introduced IDs: rollback must preserve all existing
+        // history, including unreferenced objects and duplicate upload frames.
+        let existing: std::collections::BTreeSet<_> = backend.object_ids()?.into_iter().collect();
+        let objects = objects
+            .iter()
+            .filter(|id| !existing.contains(*id))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        backend.write_metadata(
+            "incoming.json",
+            Some(&serde_json::to_string(&IncomingObjects {
+                version: 1,
+                objects,
+            })?),
+        )?;
+        Ok(Self {
+            repository,
+            complete: false,
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        // Verify the entire graph, not just each envelope, before making the
+        // batch permanent. Ref publication may begin only after this succeeds.
+        self.repository.fsck()?;
+        self.repository
+            .backend()
+            .write_metadata("incoming.json", None)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl Drop for ObjectImport<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            // On cleanup failure retain the journal; the next open retries it.
+            let _ = self.repository.backend().recover_incoming_objects();
+        }
+    }
+}
 
 fn validate_payload(kind: ObjectKind, version: u32, bytes: &[u8]) -> Result<()> {
     fn check<T: knot_core::StoredObject>(version: u32, bytes: &[u8]) -> Result<()> {
@@ -38,6 +108,34 @@ fn validate_payload(kind: ObjectKind, version: u32, bytes: &[u8]) -> Result<()> 
 }
 
 impl FsBackend {
+    pub(crate) fn recover_incoming_objects(&self) -> Result<()> {
+        let Some(text) = self.read_metadata("incoming.json")? else {
+            return Ok(());
+        };
+        let incoming: IncomingObjects = serde_json::from_str(&text)?;
+        if incoming.version != 1 || self.read_metadata("transaction.json")?.is_some() {
+            return Err(Error::Integrity(
+                "invalid incoming object recovery state".into(),
+            ));
+        }
+        for id in incoming.objects {
+            let path = self.object_path(&id)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            if let Some(parent) = path.parent()
+                && parent.exists()
+            {
+                // Also sync already absent files: recovery may itself have been
+                // interrupted after unlink and before directory persistence.
+                sync_directory_chain(parent, &self.meta)?;
+            }
+        }
+        self.write_metadata("incoming.json", None)
+    }
+
     /// Export the canonical envelope and payload, streaming blobs without buffering.
     pub fn export_object(&self, id: &ObjectId, out: &mut impl Write) -> Result<u64> {
         let (mut file, kind, _, len, header) = self.open_object(id)?;

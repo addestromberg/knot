@@ -17,6 +17,81 @@ fn review(repo: &Repository<FsBackend>, subject: ReviewSubject) -> ObjectId {
 }
 
 #[test]
+fn release_checkout_detaches_without_rewinding_a_same_spelled_branch() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    repo.write_asset("part", b"A").unwrap();
+    let first = repo.commit("Initial").unwrap();
+    repo.create_release("v1", "Engineer", "Approved").unwrap();
+    repo.write_asset("part", b"B").unwrap();
+    let second = repo.commit("Newer").unwrap();
+    repo.create_ref("release/v1", "HEAD", false).unwrap();
+    let branches = repo.refs(false).unwrap();
+    repo.apply_checkout(repo.plan_checkout("release/v1").unwrap())
+        .unwrap();
+    assert_eq!(repo.status().unwrap().branch, None);
+    assert_eq!(repo.head_id().unwrap(), Some(first));
+    assert_eq!(repo.refs(false).unwrap(), branches);
+    assert_eq!(repo.refs(false).unwrap()["release/v1"], second);
+    assert_eq!(fs::read(dir.path().join("part")).unwrap(), b"A");
+    repo.fsck().unwrap();
+}
+
+#[test]
+fn write_reverts_restore_revision_ids_and_exact_input_evidence() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    repo.write_asset("part", b"A").unwrap();
+    repo.write_asset("procedure.md", b"Measure part").unwrap();
+    repo.define_test("measure", "procedure.md", &["part".into()], "Original")
+        .unwrap();
+    repo.commit("Tested part").unwrap();
+    let record = review(&repo, repo.test_subject("measure").unwrap());
+    let original = repo.status().unwrap().staged_snapshot;
+    let revision = repo
+        .dependencies("part", None, false, false)
+        .unwrap()
+        .root
+        .revision;
+    repo.write_asset("part", b"B").unwrap();
+    let changed = repo
+        .dependencies("part", None, false, false)
+        .unwrap()
+        .root
+        .revision;
+    assert_eq!(
+        repo.load::<Revision>(&changed).unwrap().parents,
+        vec![revision.clone()]
+    );
+    assert_eq!(
+        repo.verification(None).unwrap().tests[0].state,
+        VerificationState::Stale
+    );
+    assert_eq!(repo.write_asset("part", b"A").unwrap(), original);
+    assert_eq!(
+        repo.verification(None).unwrap().tests[0].record,
+        Some(record.clone())
+    );
+    assert_eq!(
+        repo.verification(None).unwrap().tests[0].state,
+        VerificationState::Verified
+    );
+    repo.define_test("measure", "procedure.md", &["part".into()], "Changed")
+        .unwrap();
+    assert_ne!(repo.status().unwrap().staged_snapshot, original);
+    repo.define_test("measure", "procedure.md", &["part".into()], "Original")
+        .unwrap();
+    assert_eq!(repo.status().unwrap().staged_snapshot, original);
+    assert_eq!(
+        repo.verification(None).unwrap().tests[0].record,
+        Some(record)
+    );
+    assert!(repo.status().unwrap().staged.is_empty());
+    assert!(repo.diff(true).unwrap().is_empty());
+    repo.fsck().unwrap();
+}
+
+#[test]
 fn unchanged_contract_does_not_hide_stale_manual_evidence_and_history_is_reusable() {
     let dir = tempdir().unwrap();
     let root = dir.path();

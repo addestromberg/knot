@@ -26,6 +26,66 @@ fn review(repo: &Repository<FsBackend>) {
 }
 
 #[test]
+fn local_ref_creation_enforces_the_same_portable_components_as_clone_and_fsck() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("source");
+    let repo = Repository::open(FsBackend::init(&root, None).unwrap()).unwrap();
+    repo.write_asset("part", b"A").unwrap();
+    let head = repo.commit("Initial").unwrap();
+    repo.create_ref("Feature/a", "HEAD", false).unwrap();
+    let before = repo.reference_inventory().unwrap();
+    assert_eq!(
+        repo.create_ref("feature/b", "HEAD", false)
+            .unwrap_err()
+            .code(),
+        "conflict"
+    );
+    assert_eq!(repo.reference_inventory().unwrap(), before);
+    repo.create_ref("Feature/b", "HEAD", false).unwrap();
+    repo.create_ref("Version/a", "HEAD", true).unwrap();
+    assert_eq!(
+        repo.create_ref("version/b", "HEAD", true)
+            .unwrap_err()
+            .code(),
+        "conflict"
+    );
+    repo.create_ref("Version/b", "HEAD", true).unwrap();
+    repo.create_release("Approved/a", "Engineer", "Reviewed")
+        .unwrap();
+    assert_eq!(
+        repo.create_release("approved/b", "Engineer", "Reviewed")
+            .unwrap_err()
+            .code(),
+        "conflict"
+    );
+    repo.create_release("Approved/b", "Engineer", "Reviewed")
+        .unwrap();
+    repo.fsck().unwrap();
+    let expected = repo.reference_inventory().unwrap();
+    drop(repo);
+    let copy = dir.path().join("copy");
+    clone_repository(root.to_str().unwrap(), &copy, None, false).unwrap();
+    let cloned = Repository::open(FsBackend::open(copy).unwrap()).unwrap();
+    assert_eq!(cloned.reference_inventory().unwrap(), expected);
+    cloned.fsck().unwrap();
+    // Bypass public creation to model malformed metadata on disk. Only a
+    // case-sensitive filesystem can represent both directory spellings.
+    cloned
+        .backend()
+        .write_meta("refs/heads/feature/c", Some(&format!("{head}\n")))
+        .unwrap();
+    if cloned
+        .backend()
+        .list_meta("refs/heads/")
+        .unwrap()
+        .iter()
+        .any(|n| n == "refs/heads/feature/c")
+    {
+        assert!(cloned.fsck().is_err());
+    }
+}
+
+#[test]
 fn two_computers_exchange_exact_snapshots_issues_reviews_releases_and_large_blobs() {
     let source_dir = tempdir().unwrap();
     let peer_dir = tempdir().unwrap();
@@ -214,6 +274,112 @@ fn object_import_rejects_corruption_and_truncation_before_publication() {
         destination.get_object(&id).unwrap().1,
         b"immutable binary\0contents"
     );
+}
+
+#[test]
+fn interrupted_uploads_roll_back_every_frame_boundary_and_push_can_retry() {
+    let dir = tempdir().unwrap();
+    let source =
+        Repository::open(FsBackend::init(dir.path().join("source"), None).unwrap()).unwrap();
+    source.write_asset("part", b"new part").unwrap();
+    source.commit("Initial").unwrap();
+    let objects = source.backend().list_objects().unwrap();
+    let frames = objects
+        .iter()
+        .map(|id| ObjectFrame {
+            id: id.clone(),
+            len: source.backend().object_size(id).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let updates = source
+        .reference_inventory()
+        .unwrap()
+        .into_iter()
+        .map(|(name, after)| ReferenceUpdate {
+            name,
+            before: None,
+            after,
+        })
+        .collect::<Vec<_>>();
+    let mut bytes = Vec::new();
+    let mut boundaries = vec![0];
+    for id in &objects {
+        source.backend().export_object(id, &mut bytes).unwrap();
+        boundaries.push(bytes.len());
+    }
+    for (number, boundary) in boundaries[..objects.len()].iter().enumerate() {
+        let path = dir.path().join(format!("peer-{number}"));
+        let peer = Repository::open(FsBackend::init_bare(&path, None).unwrap()).unwrap();
+        // Existing unrelated objects must survive a failed upload.
+        let retained = peer
+            .backend()
+            .put_object(ObjectKind::Blob, b"existing orphan")
+            .unwrap();
+        let existing = peer.backend().list_objects().unwrap();
+        let mut stream = serde_json::to_vec(
+            &serde_json::json!({"operation":"put","objects":frames,"updates":updates}),
+        )
+        .unwrap();
+        stream.push(b'\n');
+        stream.extend_from_slice(&bytes[..*boundary]);
+        let mut output = Vec::new();
+        serve_repository(&peer, &mut Cursor::new(stream), &mut output, true).unwrap();
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses[0]["data"]["ready"], true);
+        assert_eq!(responses[1]["ok"], false);
+        assert!(
+            responses[1]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("truncated object transfer")
+        );
+        assert_eq!(peer.backend().list_objects().unwrap(), existing);
+        assert!(peer.head_id().unwrap().is_none());
+        assert!(peer.backend().read_meta("incoming.json").unwrap().is_none());
+        peer.fsck().unwrap();
+        drop(peer);
+        let name = format!("peer-{number}");
+        remote_add(&source, &name, path.to_str().unwrap()).unwrap();
+        push(&source, &name, None).unwrap();
+        let peer = Repository::open(FsBackend::open(&path).unwrap()).unwrap();
+        assert_eq!(peer.head_id().unwrap(), source.head_id().unwrap());
+        assert_eq!(
+            peer.backend().get_object(&retained).unwrap().1,
+            b"existing orphan"
+        );
+        peer.fsck().unwrap();
+    }
+}
+
+#[test]
+fn a_complete_batch_with_missing_graph_references_is_rolled_back() {
+    let dir = tempdir().unwrap();
+    let source =
+        Repository::open(FsBackend::init(dir.path().join("source"), None).unwrap()).unwrap();
+    source.write_asset("part", b"new part").unwrap();
+    let commit = source.commit("Initial").unwrap();
+    let peer =
+        Repository::open(FsBackend::init_bare(dir.path().join("peer"), None).unwrap()).unwrap();
+    let existing = peer.backend().list_objects().unwrap();
+    let mut stream = serde_json::to_vec(&serde_json::json!({"operation":"put","objects":[{"id":commit,"len":source.backend().object_size(&commit).unwrap()}],"updates":[]})).unwrap();
+    stream.push(b'\n');
+    source
+        .backend()
+        .export_object(&commit, &mut stream)
+        .unwrap();
+    let mut output = Vec::new();
+    serve_repository(&peer, &mut Cursor::new(stream), &mut output, true).unwrap();
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("missing object")
+    );
+    assert_eq!(peer.backend().list_objects().unwrap(), existing);
+    peer.fsck().unwrap();
 }
 
 #[test]

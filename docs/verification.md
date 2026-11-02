@@ -91,6 +91,9 @@ knot checkout release/v1.0 --preview
 knot checkout main --validated
 ```
 
+`checkout release/<name>` detaches HEAD at the release commit and preserves all
+branches, including any branch with the same spelling as the release selector.
+
 Relations are `documents`, `describes`, `satisfies`, or `verifies`. Generated
 `docs/trace/*.knot-link.json` manifests follow commits. Links bind exact source and
 target revisions; queries report `current: false` for potentially outdated links.

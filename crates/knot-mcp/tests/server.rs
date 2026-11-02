@@ -29,6 +29,90 @@ fn approved(mut args: Value, preview: &Value) -> Value {
 }
 
 #[test]
+fn switching_symbolic_head_invalidates_write_and_commit_previews() {
+    for commit in [false, true] {
+        for detached in [false, true] {
+            let dir = tempdir().unwrap();
+            let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+            repo.write_asset("part", b"A").unwrap();
+            let head = repo.commit("Initial").unwrap();
+            repo.create_ref("other", "HEAD", false).unwrap();
+            if commit {
+                repo.write_asset("part", b"B").unwrap();
+            }
+            drop(repo);
+            let mut server = Server::new(dir.path(), true);
+            let name = if commit {
+                "knot_commit"
+            } else {
+                "knot_write_file"
+            };
+            let args = if commit {
+                json!({"message":"Updated"})
+            } else {
+                json!({"path":"part","content":"B"})
+            };
+            let preview =
+                call(&mut server, name, args.clone())["result"]["structuredContent"].clone();
+            let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+            if commit {
+                repo.write_asset("part", b"A").unwrap();
+            }
+            let target = if detached { head.as_str() } else { "other" };
+            repo.apply_checkout(repo.plan_checkout(target).unwrap())
+                .unwrap();
+            if commit {
+                repo.write_asset("part", b"B").unwrap();
+            }
+            let before = repo.status().unwrap();
+            let refs = repo.reference_inventory().unwrap();
+            let objects = repo.backend().list_objects().unwrap();
+            assert_eq!(json!(before.staged_snapshot), preview["expected_snapshot"]);
+            assert_eq!(json!(before.head), preview["expected_head"]);
+            drop(repo);
+            let response = call(&mut server, name, approved(args, &preview));
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+            assert_eq!(repo.reference_inventory().unwrap(), refs);
+            assert_eq!(
+                repo.status().unwrap().staged_snapshot,
+                before.staged_snapshot
+            );
+            assert_eq!(repo.backend().list_objects().unwrap(), objects);
+            assert_eq!(
+                fs::read(dir.path().join("part")).unwrap(),
+                if commit { b"B" } else { b"A" }
+            );
+        }
+    }
+}
+
+#[test]
+fn writing_then_reverting_through_mcp_restores_the_committed_snapshot() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    repo.write_asset("part", b"A").unwrap();
+    repo.commit("Initial").unwrap();
+    let original = repo.status().unwrap().staged_snapshot;
+    drop(repo);
+    let mut server = Server::new(dir.path(), true);
+    for content in ["B", "A"] {
+        let args = json!({"path":"part","content":content});
+        let preview =
+            call(&mut server, "knot_write_file", args.clone())["result"]["structuredContent"]
+                .clone();
+        let response = call(&mut server, "knot_write_file", approved(args, &preview));
+        assert_eq!(response["result"]["isError"], false, "{response}");
+    }
+    let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+    assert_eq!(repo.status().unwrap().staged_snapshot, original);
+    assert!(repo.status().unwrap().staged.is_empty());
+    assert!(repo.status().unwrap().unstaged.is_empty());
+    repo.apply_checkout(repo.plan_checkout("main").unwrap())
+        .unwrap();
+}
+
+#[test]
 fn modern_discovery_is_stateless_and_legacy_handshake_is_supported() {
     let dir = tempdir().unwrap();
     let mut server = Server::new(dir.path(), false);

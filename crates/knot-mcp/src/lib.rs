@@ -247,12 +247,14 @@ fn worktree(repo: &Repository<FsBackend>) -> Result<ObjectId> {
 }
 
 fn reference_state(repo: &Repository<FsBackend>) -> Result<ObjectId> {
-    let refs = repo
+    let mut refs = repo
         .backend()
         .list_meta("refs/")?
         .into_iter()
         .map(|name| Ok((name.clone(), repo.backend().read_meta(&name)?)))
         .collect::<Result<Vec<_>>>()?;
+    // A branch switch can leave every ref and the resolved commit unchanged.
+    refs.push(("HEAD".into(), repo.backend().read_meta("HEAD")?));
     Ok(object_id(ObjectKind::Blob, &canonical(&refs)?))
 }
 

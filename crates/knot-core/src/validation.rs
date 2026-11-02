@@ -917,7 +917,7 @@ impl<B: Backend> Repository<B> {
         let revision = Revision {
             asset,
             blob: blob.clone(),
-            parents: parent.into_iter().collect(),
+            parents: parent.clone().into_iter().collect(),
             executable: false,
             dependencies: old
                 .as_ref()
@@ -925,7 +925,14 @@ impl<B: Backend> Repository<B> {
                 .unwrap_or_default(),
             interfaces: old.map(|r| r.interfaces).unwrap_or_default(),
         };
-        tree.insert(path.into(), self.put(&revision)?);
+        let revision_id = if let Some(id) = parent
+            && same_revision_state(&revision, &self.load::<Revision>(&id)?)
+        {
+            id
+        } else {
+            self.put(&revision)?
+        };
+        tree.insert(path.into(), revision_id);
         self.check_destinations(&self.index_tree()?, &tree)?;
         let snapshot = self.save_tree(&tree)?;
         let mut tx = Transaction::new("write versioned engineering manifest");
@@ -1140,6 +1147,7 @@ impl<B: Backend> Repository<B> {
         if self.backend.read_meta(&reference)?.is_some() {
             return Err(Error::Conflict("release already exists".into()));
         }
+        self.check_reference_name(&reference)?;
         let id = self.put(&release)?;
         let mut tx = Transaction::new("create approved release");
         tx.metadata
