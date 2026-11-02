@@ -1,12 +1,12 @@
 # Architecture decisions
 
-Status: M1 and M2 implemented; readable repository formats 1 and 2. Changes to canonical bytes require an explicit format decision and compatibility tests.
+Status: M1–M6 implemented; readable repository capability markers 1, 2, and 3. Changes to canonical bytes require an explicit format decision and compatibility tests.
 
 ## Backend and interface boundaries
 
-All backend functionality is Rust. `knot-core` contains typed objects, portable path rules, structured errors, the `Backend` trait, and `Repository<B>` domain operations. `knot-store` implements that trait with a filesystem and holds a repository lock for its lifetime. `knot-cli` parses commands, resolves operation-relative paths, and renders results. The future MCP server, server APIs, and React frontend must reuse the domain operations.
+All backend functionality is Rust. `knot-core` contains typed objects, portable path rules, structured errors, the `Backend` trait, and `Repository<B>` domain operations. `knot-store` implements that trait with a filesystem and holds a repository lock for its lifetime. `knot-cli` parses commands, resolves operation-relative paths, and renders results. `knot-mcp` uses those same domain operations. The product is CLI-only; the hosting/React proposal has been removed.
 
-Three crates provide enough separation without the proposed eight mostly empty crates. The M2 graph stays in `knot-core` to reuse staging and integrity operations; resolver and validation crates can be extracted when those engines exist. Synchronous I/O avoids requiring an asynchronous runtime in local core operations; a future server may place it behind worker boundaries.
+Four crates provide the domain, filesystem/transports, CLI, and MCP boundaries. Graph, resolution, verification, and ref-publication logic stay in `knot-core`; filesystem/SSH/mesh adapters stay in `knot-store`. Synchronous I/O avoids requiring an asynchronous runtime in local core operations; a future server may place it behind worker boundaries.
 
 ## Hidden contradictions resolved
 
@@ -14,8 +14,8 @@ Three crates provide enough separation without the proposed eight mostly empty c
 2. **Determinism versus historical metadata:** snapshots contain only sorted paths and exact revisions. Revision objects omit timestamps. Commits include author, time, message, and parents, so different commits may reference the same snapshot. Independently initialized repositories are not expected to generate identical random asset identities.
 3. **File hash versus object ID:** the conceptual SHA-256(file-bytes) formula is replaced with a type/version/length-separated envelope for every stored object, including blobs. Identical blob bytes still deduplicate. The full SHA-256 digest identifies an exact revision; labels such as R10 are not globally meaningful identities.
 4. **Reconstructable indexes versus uncommitted staging:** `.knot/index` is an authoritative pointer to an immutable snapshot. It is not a disposable derived index. Lookup indexes and caches may be discarded; objects, refs, staging, configuration, and recovery records must be preserved.
-5. **Validation circularity:** validation evidence must reference the input snapshot, never become part of that snapshot. Future resolution proves only declared compatibility and must report unknown checks; it does not itself validate an engineering design.
-6. **Issue history versus engineering branches:** issues have independent event chains under `refs/issues/`. Returning to an old CAD/firmware snapshot must not rewind current engineering discussion. These events can be exchanged through future object/ref synchronization without a database.
+5. **Validation circularity:** validation evidence must reference the input snapshot, never become part of that snapshot. Resolution proves only declared compatibility and must report unknown checks; it does not itself validate an engineering design.
+6. **Issue history versus engineering branches:** issues have independent event chains under `refs/issues/`. Returning to an old CAD/firmware snapshot must not rewind current engineering discussion. These events are exchanged through object/ref synchronization without a database.
 7. **Atomic file writes versus whole-tree checkout:** a tree cannot be atomically replaced file by file. Journaled operations therefore store complete before/after fingerprints and metadata values, retain immutable backup blobs, and support guarded continuation or rollback.
 
 ## Consistency and concurrency
@@ -42,16 +42,49 @@ A copied `.knot/` contains everything needed to reconstruct tracked bytes with `
 
 M1 verifies storage, identity, staging, history, branches/tags, checkout, recovery, JSON interfaces, and independent issues. The electromechanical test fixture uses CAD/PCB-like binary bytes plus firmware source; it does not claim geometric interpretation.
 
-M2 now adds stable-ID dependency/interface objects, exact requirement checks, cycle-safe traversal, reverse queries, and contract-aware impact analysis. Its graph follows immutable revision references, not mutable global configuration. M3 adds deterministic resolution, previews, and structured conflicts. M4 adds exact-input validation evidence and documentation traceability. Only then can the complete housing–PCB–firmware compatibility scenario be considered implemented. M5 adds MCP/Skills; M6 transfers objects/refs; M7 adds hosting and React.
+M2 adds stable-ID requirements and contract-aware impact. M3 resolves compatible configurations with previews, structured conflicts, ancestry ranges, and a documented bounded policy. M4 binds manual review/test evidence and traceability to exact inputs, gates releases, and audits operator overrides. M5 provides the Rust MCP server and five skills. M6 exchanges verified objects/refs and reconstructs equivalent working states. Integration tests cover these workflows without claiming geometric interpretation, automatic test execution, or a tested live internet deployment.
 
 ## M2 decisions
 
 Engineering metadata belongs to the owner Revision. A dependency or export change therefore creates a metadata revision even when bytes are identical; it does not modify an existing revision. Repeated staging retains committed ancestry, and `add` preserves staged declarations. Snapshot/Commit encodings and all M1 golden hashes stay unchanged. Revision schema 2 and a conservative repository capability marker provide explicit forward incompatibility for old readers.
 
-M2 checks exact declared revision hashes and exact interface versions. Range solving and inferred physical compatibility are deferred. Interface definitions are explicit opaque bytes, so unchanged contracts can survive a content revision; they are user-maintained declarations, not validation evidence. Default commit/checkout reject unsatisfied declarations, while explicit `--allow-incompatible` records/restores WIP without weakening integrity or dirty-file protections.
+M2 checks exact declared revision hashes and exact interface versions. M3 adds ancestry-range solving; inferred physical compatibility remains deferred. Interface definitions are explicit opaque bytes, so unchanged contracts can survive a content revision; they are user-maintained declarations, not validation evidence. Default commit/checkout reject unsatisfied declarations, while explicit `--allow-incompatible` records/restores WIP without weakening integrity or dirty-file protections.
 
-Graph queries default to staging and accept committed historical views. Impact without a baseline reports potential reverse reachability; `--since` compares actual selected revisions and interface exports, suppressing unchanged direct contracts. Downstream propagation is conservatively reported for review. No test execution, stale-evidence decisions, or automatic compatibility resolution is claimed.
+Graph queries default to staging and accept committed historical views. Impact without a baseline reports potential reverse reachability; `--since` compares actual selected revisions and interface exports, suppressing unchanged direct contracts. Downstream propagation is conservatively reported for review. These M2 queries remain distinct from M3 resolution and M4 manual evidence applicability; they do not execute engineering tests.
 
 ## Verification direction
 
-Prioritize manual review records and dependency-change warnings before automated engineering validators. Review applicability is derived from exact recorded inputs, while downstream warnings identify unresolved upstream reviews. Matching declarations and human verification are separate states. No agent or extractor is required, and unchanged interface declarations alone must not suppress manual review of changed endpoint revisions. Evidence stays outside engineering state hashes. See [the planned workflow](engineering-graph.md#planned-manual-verification-workflow); this does not change current M2 behavior.
+Prioritize manual review records and dependency-change warnings before automated engineering validators. Review applicability is derived from exact recorded inputs, while downstream warnings identify unresolved upstream reviews. Matching declarations and human verification are separate states. No agent or extractor is required, and unchanged interface declarations alone must not suppress manual review of changed endpoint revisions. Evidence stays outside engineering state hashes. See [manual verification](verification.md). The implemented M4 report is separate from declared requirement status.
+
+## M3–M6 decisions
+
+- Resolution orders current dependency roots and paths, then prefers revisions by
+  ancestor count and hash. It retains relationship keys, respects pins, and bounds
+  search. Applying a result stages it; it cannot silently advance HEAD.
+- Test and trace manifests are tracked files pointing to typed immutable objects.
+  Procedures/definitions follow engineering commits. Evidence heads are independent
+  refs, so a checkout finds applicable historical records without rewinding review
+  discussion. Failed records for the same inputs supersede earlier passes.
+- Dependency reviews bind exact endpoint revisions even when declared contracts
+  match. Upstream warnings identify unresolved relationships instead of creating
+  false local test failures. Automated validators can later emit the same evidence.
+- The explicit `rape` operator command rebinds accepted requirements and records
+  overrides. A commit using applicable override evidence stores its IDs and is
+  displayed `(raped)`. This changes only new commit schema-2 objects; old hashes
+  remain unchanged. Records distinguish override acceptance from test execution.
+- Releases bind historical evidence and a snapshot policy; integrity checks verify
+  that evidence directly rather than consulting mutable current review heads.
+- MCP uses bounded stdio JSON-RPC without an async framework. Writes require local
+  startup authorization, explicit apply, and expected HEAD/staging/worktree/reference state.
+  Self-reported client names are never authorization.
+- Synchronization transfers missing objects with streaming verification, then uses
+  one recoverable ref/checkout transaction. Fast-forward-only rules prevent silent
+  overwrites; issue/review forks are conflicts too. Bare peers avoid working-tree
+  ambiguity. Ref names are checked as a portable, collision-free set.
+- OpenSSH delegates account/key authentication and strict host verification to the
+  OS. An optional Tailscale adapter supplies WireGuard/NAT traversal/relay support;
+  ordinary core operations have no provider dependency. LAN multicast is opt-in
+  discovery only. A discovered address is not proof of identity or permission.
+- No GitHub-style host or React UI is planned. Block deduplication, partial clone,
+  automated merge, background sync scheduling, and native VPN implementation remain
+  separate future work.

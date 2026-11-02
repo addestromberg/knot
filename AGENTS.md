@@ -2,9 +2,9 @@
 
 ## Project Structure & Architecture
 
-Knot is an offline-first engineering version control system. All backend code is Rust; a future frontend will use React. `crates/knot-core/` owns domain models, storage traits, and repository operations. `crates/knot-store/` implements filesystem storage; `crates/knot-cli/` provides the `knot` executable. Future MCP and server adapters must reuse these libraries. Architecture and format decisions live in `docs/`.
+Knot is an offline-first engineering version control system. Use Rust; the CLI is the product interface, with MCP for agents. `crates/knot-core/` owns domain models, storage traits, and repository operations. `crates/knot-store/` implements filesystem storage; `crates/knot-cli/` provides `knot`; `crates/knot-mcp/` provides the stdio agent server. Adapters must reuse these libraries. Design decisions live in `docs/`.
 
-Repository state lives in `.knot/`, without a database or required service. Objects are immutable, schema-versioned, and content-addressed. Snapshot hashes exclude issue activity and validation evidence. Local issues have independent immutable history and survive engineering checkouts. M2 adds versioned dependencies, exact revision/interface requirements, reverse traversal, and impact analysis. Keep automatic resolution, validation engines, MCP, remotes, and React outside M2. Engineering requirements are declarations, not evidence that physical tests passed.
+Repository state lives in `.knot/`, without a database or required service. Objects are immutable, schema-versioned, and content-addressed. Snapshot hashes exclude issue activity and validation evidence. Local issues have independent immutable history and survive engineering checkouts. M3–M6 add deterministic resolution, manual verification, traceability, releases, MCP/skills, and peer synchronization. Keep geometry extraction and external test runners optional. Matching declarations do not prove engineering compatibility. Operator overrides retain audit records and mark commits `(raped)`.
 
 ## Build, Test, and Development Commands
 
@@ -22,7 +22,7 @@ Before adding or upgrading dependencies, verify the latest stable releases on cr
 
 ## Testing & Safety
 
-Add behavior and regression tests alongside changes. Use temporary repositories, deterministic hash vectors, copied-repository reconstruction, concurrency checks, and interrupted-transaction recovery tests. Preserve asset IDs across explicit renames. Never overwrite dirty files or untracked checkout destinations. Publish verified objects before advancing refs; keep mutations locked and recoverable. Preserve schema-1 hashes; engineering metadata uses revision schema 2. Commit and checkout reject unsatisfied requirements unless explicitly overridden.
+Add behavior and regression tests alongside changes. Use temporary repositories, deterministic hash vectors, copied-repository reconstruction, concurrency checks, and interrupted-transaction recovery tests. Preserve asset IDs across explicit renames. Never overwrite dirty files or untracked checkout destinations. Publish verified objects before advancing refs; keep mutations locked and recoverable. Preserve legacy hashes; new schemas require explicit capability markers. Commit and checkout reject unsatisfied requirements unless explicitly overridden. Synchronization verifies objects before journaled, fast-forward-only ref updates. Mesh services remain optional; discovery hints never grant access.
 
 ## Commits & Pull Requests
 

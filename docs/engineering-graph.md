@@ -1,6 +1,6 @@
 # M2 engineering graph
 
-M2 adds immutable dependency/interface declarations and snapshot-based graph queries. It does not select compatible revisions automatically or execute engineering tests.
+M2 adds immutable dependency/interface declarations and snapshot-based graph queries. M3 now adds compatible revision resolution; M4 separately records manual verification. This guide retains the M2 declaration model.
 
 ## What follows a commit
 
@@ -66,7 +66,7 @@ Editing a file does not advance HEAD. `add` creates immutable staged revisions a
 
 Dependency checks inspect staging, not unstaged file bytes. After editing a model, use `add`, `status`, `impact --since HEAD`, and `graph` before committing. If a PCB's exact pin breaks, adapt or independently verify the PCB, then explicitly update its requirement. Do not repin merely to silence a conflict. Exact firmware/test-procedure consumers may also need updated requirements when their target PCB revision changes.
 
-For an interface-based dependency, a CAD change retaining the same declared interface remains satisfied. You must explicitly update the contract definition and re-register it when the physical interface changes. M2 cannot detect undeclared geometric or electrical changes, execute engineering tests, or establish pass/fail evidence automatically.
+For an interface-based dependency, a CAD change retaining the same declared interface remains satisfied. You must explicitly update the contract definition and re-register it when the physical interface changes. Knot cannot detect undeclared geometric or electrical changes or establish physical pass/fail evidence automatically. M4 records explicit manual verification and staleness.
 
 ## Status, conflicts, and explicit WIP
 
@@ -82,7 +82,7 @@ Graph statuses are:
 
 `status` reports `requirements_satisfied` and `dependency_conflicts`; staged diffs identify `constraints` and `interfaces` changes even when bytes are identical. Staging is permitted to be incomplete. Default commit and checkout reject unsatisfied requirements. JSON errors use exit 3, `dependency_conflict`, and `details.conflicts` with source, target, expected requirement, actual selection, and status.
 
-Human-readable `status` also displays staged/unstaged/untracked changes and the complete staged dependency tree. Parent nodes depend on child nodes; each asset is expanded once, with numbered references for shared dependencies and cycles. Nodes show the selected revision and change markers. Edges show the required revision or named interface and whether it matches, including missing targets/exports and mismatches. Disconnected files are included. Unstaged edits produce an explicit warning and do not silently change the graph. `graph` uses the same renderer for staged or historical views. JSON status includes the full report as `dependency_graph` while preserving existing fields; neither format claims recorded manual verification.
+Human-readable `status` also displays staged/unstaged/untracked changes and the complete staged dependency tree. Parent nodes depend on child nodes; each asset is expanded once, with numbered references for shared dependencies and cycles. Nodes show the selected revision and change markers. Edges show the required revision or named interface and whether it matches, including missing targets/exports and mismatches. Disconnected files are included. Unstaged edits produce an explicit warning and do not silently change the graph. `graph` uses the same renderer for staged or historical views. JSON status includes the full report as `dependency_graph` while preserving existing fields; status also includes a separate `verification` report for M4 evidence; graph matches alone do not establish verification.
 
 `commit --allow-incompatible` explicitly records a WIP snapshot; `checkout --allow-incompatible` explicitly restores one. These overrides do not bypass content integrity, object ownership, recovery, or dirty-file protection. `fsck` checks structural integrity and can pass for an intentionally recorded incompatible configuration.
 
@@ -94,19 +94,23 @@ For comparisons, direct exact-revision consumers are affected when the target re
 
 For PCB R3 pinned to Housing R5, with firmware/electrical procedures depending on PCB R3 and a mechanical procedure depending on Housing R5, staging Housing R6 reports the PCB and mechanical procedure directly, and the firmware/electrical procedures transitively. Exact pin mismatches prevent an ordinary commit until requirements/configuration are updated or WIP is explicitly allowed. Checkout restores the historical graph as well as file bytes.
 
-Test procedures and documentation can already be ordinary assets with declared dependencies. Manual verification records, evidence applicability, and semantic documentation references remain M4; automated runners can follow later. Automatic compatible PCB/firmware selection and revision ranges remain M3.
+Test procedures and documentation are ordinary assets. M3 implements compatible selection and ancestry ranges; M4 implements manual evidence, versioned test manifests, traceability links, and release gates. Automated engineering runners remain optional future extensions.
 
-## Planned manual verification workflow
+## Manual verification workflow (M4)
 
-The first verification feature should require no agent, geometry extractor, or test script. Track whether a person reviewed a dependency for the exact selected revisions, independently of whether its declarations match. This is planned behavior, not an existing M2 command or status.
+A changed pipe revision makes its rod-fit review stale even when its declared
+interface stays unchanged. Status reports that relationship separately from
+satisfied requirement pins, and identifies downstream assets as unverified
+upstream. A person can confirm that an external mount leaves fit unchanged and
+record the exact revision pair with notes. This does not change the rod's bytes.
 
-For a rod depending on a pipe, changing the pipe should flag the direct relationship as needing review and show downstream assets as potentially affected. This conservative manual-review warning should apply even if a declared interface stays unchanged; the current M2 interface-aware impact query intentionally suppresses unchanged contracts and is not sufficient on its own for this warning. A reviewer may confirm that an added external mount leaves the rod fit unchanged, record the reason, and verify the new revision pair without changing the rod's file bytes.
+Records remain immutable and independent of snapshots/HEAD. Historical checkout
+can reuse applicable evidence; unrelated file edits and path-only renames do not
+invalidate it. Release policies require current evidence. Explicit operator
+acceptance through `rape` is audited and marks commits `(raped)`.
 
-Review records should reference stable asset identities, exact endpoint revisions, the dependency requirement and any declared additional inputs, reviewer, timestamp, outcome, and notes or evidence. Metadata updates and acknowledgments must be bound to the final reviewed configuration. Preserve older records instead of overwriting them. A record is stale when its inputs no longer match; an unrelated edit or path-only rename should not invalidate it. New review evidence must not itself change engineering revisions or snapshot hashes.
-
-Report direct review state separately from downstream warnings: `unverified`, `verified`, `stale`, or `failed`, with an explanation such as "unverified upstream: pipe/rod relationship needs review." Downstream warnings identify the unresolved upstream relationship; they do not manufacture local failures or require a fresh acknowledgment for every transitive node. Resolving all applicable upstream reviews clears those warnings. Reverification is an explicit human assessment, not a silent update of revision pins or proof inferred from a matching interface.
-
-Keep ordinary development possible with visible warnings. A future release policy may require current reviews. Existing M2 commit/checkout rejection of unsatisfied exact requirements remains separate and unchanged; changing that policy would require its own implementation decision.
+See [manual verification, tests, and releases](verification.md) and
+[compatible resolution](resolution.md) for commands and exact applicability rules.
 
 ## Format and verification
 

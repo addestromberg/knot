@@ -536,6 +536,7 @@ fn portable_fixture_has_the_same_full_snapshot_and_commit_hashes_on_every_platfo
         message: "Portable fixture".into(),
         author: None,
         timestamp: "1700000000".into(),
+        overrides: vec![],
     };
     let commit = backend
         .put_object(ObjectKind::Commit, &canonical(&commit).unwrap())

@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/knot-core", "crates/knot-store", "crates/knot-cli"]
+members = ["crates/knot-core", "crates/knot-store", "crates/knot-cli", "crates/knot-mcp"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
 

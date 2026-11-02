@@ -3,6 +3,46 @@ use knot_core::*;
 use serde_json::json;
 
 #[test]
+fn range_and_override_commit_match_independent_schema_two_vectors() {
+    // Independently generated using Python json.dumps(sort_keys=True) and hashlib.sha256.
+    let id = |byte: &str| byte.repeat(32).parse::<ObjectId>().unwrap();
+    let dependency = Dependency {
+        dependent: id("11"),
+        target: id("22"),
+        requirement: DependencyRequirement::RevisionRange {
+            minimum: id("33"),
+            maximum: None,
+        },
+    };
+    assert_eq!(dependency.schema_version(), 2);
+    assert_eq!(
+        object_id_versioned(ObjectKind::Dependency, 2, &canonical(&dependency).unwrap()).as_str(),
+        "c0e17590c2876783e9b66d81208ddde541de0308bc3f2dfaab9deb7330edbe99"
+    );
+    let mut commit = Commit {
+        snapshot: id("44"),
+        parents: vec![id("55")],
+        message: "Accept selected revisions".into(),
+        author: Some("Operator".into()),
+        timestamp: "1700000000".into(),
+        overrides: vec![id("66")],
+    };
+    assert_eq!(commit.schema_version(), 2);
+    assert_eq!(
+        object_id_versioned(ObjectKind::Commit, 2, &canonical(&commit).unwrap()).as_str(),
+        "dee42d68527ea53a3cce3d9cdcf58238ff3199ab25a099edaabef14fa0805a4e"
+    );
+    commit.overrides.clear();
+    assert_eq!(commit.schema_version(), 1);
+    assert!(
+        serde_json::to_value(&commit)
+            .unwrap()
+            .get("overrides")
+            .is_none()
+    );
+}
+
+#[test]
 fn object_hashes_match_independent_golden_vectors() {
     assert_eq!(
         object_header(ObjectKind::Blob, 6),
@@ -99,6 +139,7 @@ fn typed_models_reject_noncanonical_metadata_and_duplicate_parents() {
         message: "Test".into(),
         author: None,
         timestamp: "01700000000".into(),
+        overrides: vec![],
     };
     assert!(commit.validate().is_err());
     commit.timestamp = "1700000000".into();

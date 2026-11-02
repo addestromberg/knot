@@ -30,6 +30,7 @@ pub struct Status {
     pub dependency_conflicts: Vec<DependencyEdge>,
     pub requirements_satisfied: bool,
     pub dependency_graph: GraphReport,
+    pub verification: VerificationReport,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoryEntry {
@@ -218,9 +219,15 @@ impl<B: Backend> Repository<B> {
     fn validate_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         snapshot.validate()?;
         let mut assets = BTreeSet::new();
+        let mut test_names = BTreeSet::new();
         for entry in &snapshot.entries {
             let revision = self.load::<Revision>(&entry.revision)?;
             self.verify_revision_metadata(&revision)?;
+            if let Some(name) = self.validate_versioned_manifest(&entry.path, &revision)?
+                && !test_names.insert(name)
+            {
+                return Err(Error::Integrity("duplicate test name in snapshot".into()));
+            }
             if !assets.insert(revision.asset) {
                 return Err(Error::Integrity("asset occurs twice in snapshot".into()));
             }
@@ -248,7 +255,7 @@ impl<B: Backend> Repository<B> {
             executable: revision.executable,
         })
     }
-    fn meta_change(&self, name: &str, after: Option<String>) -> Result<MetaChange> {
+    pub(crate) fn meta_change(&self, name: &str, after: Option<String>) -> Result<MetaChange> {
         Ok(MetaChange {
             name: name.into(),
             before: self.backend.read_meta(name)?,
@@ -269,6 +276,9 @@ impl<B: Backend> Repository<B> {
         let index = self.index_tree()?;
         let mut unstaged = Vec::new();
         for (path, rev) in &index {
+            if self.backend.is_bare() {
+                break;
+            }
             let expected = self.state(rev)?;
             let actual = self.backend.file_state(path, expected.executable)?;
             if actual.as_ref() != Some(&expected) {
@@ -283,7 +293,11 @@ impl<B: Backend> Repository<B> {
                 });
             }
         }
-        let files = self.backend.list_files(false)?;
+        let files = if self.backend.is_bare() {
+            vec![]
+        } else {
+            self.backend.list_files(false)?
+        };
         let untracked = files
             .into_iter()
             .filter(|path| !index.contains_key(path))
@@ -296,10 +310,12 @@ impl<B: Backend> Repository<B> {
             .cloned()
             .collect();
         let requirements_satisfied = dependency_conflicts.is_empty();
+        let verification = self.verification_snapshot(&dependency_graph)?;
         Ok(Status {
             dependency_conflicts,
             requirements_satisfied,
             dependency_graph,
+            verification,
             branch: self.head_ref()?.map(|r| r["refs/heads/".len()..].into()),
             snapshot: head
                 .as_ref()
@@ -315,6 +331,9 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn add(&self, scopes: &[String]) -> Result<ObjectId> {
+        if self.backend.is_bare() {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         self.ensure_ready()?;
         if scopes.is_empty() {
             return Err(Error::Invalid("provide at least one path".into()));
@@ -418,12 +437,23 @@ impl<B: Backend> Repository<B> {
             self.require_satisfied(&index)?;
         }
         let parent = self.head_id()?;
+        let mut overrides = Vec::new();
+        for entry in self
+            .verification_snapshot(&self.graph_snapshot(&index)?)?
+            .dependencies
+        {
+            if entry.overridden && entry.state == VerificationState::Verified {
+                overrides.extend(entry.record);
+            }
+        }
+        overrides.sort();
         let commit = Commit {
             snapshot: index,
             parents: parent.into_iter().collect(),
             message: message.into(),
             author: self.backend.author()?,
             timestamp: timestamp()?,
+            overrides,
         };
         let id = self.put(&commit)?;
         let target = self.head_ref()?.unwrap_or_else(|| "HEAD".into());
@@ -435,6 +465,14 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn resolve(&self, target: &str) -> Result<ObjectId> {
+        if let Some(name) = target.strip_prefix("release/") {
+            validate_ref_name(name)?;
+            let text = self
+                .backend
+                .read_meta(&format!("refs/releases/{name}"))?
+                .ok_or_else(|| Error::NotFound(format!("release {name}")))?;
+            return Ok(self.load::<Release>(&parse_pointer(&text)?)?.commit);
+        }
         if target == "HEAD" {
             return self
                 .head_id()?
@@ -652,6 +690,9 @@ impl<B: Backend> Repository<B> {
         target: &str,
         allow_incompatible: bool,
     ) -> Result<CheckoutPlan> {
+        if self.backend.is_bare() {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         self.ensure_ready()?;
         let status = self.status()?;
         if !status.staged.is_empty() || !status.unstaged.is_empty() {
@@ -710,7 +751,7 @@ impl<B: Backend> Repository<B> {
         }
         self.execute(plan.transaction)
     }
-    fn check_destinations(&self, before: &Tree, after: &Tree) -> Result<()> {
+    pub(crate) fn check_destinations(&self, before: &Tree, after: &Tree) -> Result<()> {
         let mut spellings = BTreeMap::new();
         for path in before.keys().chain(after.keys()) {
             for prefix in path
@@ -737,7 +778,7 @@ impl<B: Backend> Repository<B> {
         .map_err(|e| Error::Conflict(format!("untracked path blocks checkout: {e}")))?;
         Ok(())
     }
-    fn tree_file_changes(&self, before: &Tree, after: &Tree) -> Result<Vec<FileChange>> {
+    pub(crate) fn tree_file_changes(&self, before: &Tree, after: &Tree) -> Result<Vec<FileChange>> {
         let paths: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
         let mut changes = Vec::new();
         for path in paths {
@@ -764,6 +805,9 @@ impl<B: Backend> Repository<B> {
         staged: bool,
         preview: bool,
     ) -> Result<RestoreResult> {
+        if self.backend.is_bare() {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         self.ensure_ready()?;
         if scopes.is_empty() {
             return Err(Error::Invalid("provide paths to restore".into()));
@@ -855,6 +899,9 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn move_asset(&self, from: &str, to: &str, preview: bool) -> Result<Vec<FileChange>> {
+        if self.backend.is_bare() {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         self.ensure_ready()?;
         validate_path(from)?;
         validate_path(to)?;
@@ -899,6 +946,9 @@ impl<B: Backend> Repository<B> {
         Ok(result)
     }
     pub fn remove(&self, path: &str, preview: bool) -> Result<Vec<FileChange>> {
+        if self.backend.is_bare() {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         self.ensure_ready()?;
         validate_path(path)?;
         let mut tree = self.index_tree()?;
@@ -965,12 +1015,54 @@ impl<B: Backend> Repository<B> {
                 ObjectKind::Interface => {
                     self.verify_interface(&self.load::<Interface>(id)?)?;
                 }
+                ObjectKind::ValidationRecord => {
+                    self.verify_validation_record(&self.load::<ValidationRecord>(id)?)?
+                }
+                ObjectKind::TestDefinition => {
+                    let definition = self.load::<TestDefinition>(id)?;
+                    self.load::<Asset>(&definition.procedure)?;
+                    for input in definition.inputs {
+                        self.load::<Asset>(&input)?;
+                    }
+                }
+                ObjectKind::TraceLink => {
+                    let link = self.load::<TraceLink>(id)?;
+                    if self.load::<Revision>(&link.source_revision)?.asset != link.source
+                        || self.load::<Revision>(&link.target_revision)?.asset != link.target
+                    {
+                        return Err(Error::Integrity("trace revision identity mismatch".into()));
+                    }
+                }
+                ObjectKind::Release => {
+                    let release = self.load::<Release>(id)?;
+                    self.verify_release(&release)
+                        .map_err(|e| Error::Integrity(e.to_string()))?;
+                }
                 ObjectKind::Snapshot => {
                     self.tree(id)?;
+                    self.tests_in_snapshot(id)?;
+                    for node in self.graph_snapshot(id)?.nodes {
+                        if let Some(link) =
+                            self.manifest_id(&node, ObjectKind::TraceLink, ".knot-link.json")?
+                        {
+                            self.load::<TraceLink>(&link)?;
+                        }
+                    }
                 }
                 ObjectKind::Commit => {
                     let c = self.load::<Commit>(id)?;
                     self.tree(&c.snapshot)?;
+                    for id in c.overrides {
+                        let record = self.load::<ValidationRecord>(&id)?;
+                        self.verify_validation_record(&record)?;
+                        if record.override_snapshot.is_none()
+                            || !self.record_covers_snapshot(&record, &c.snapshot)?
+                        {
+                            return Err(Error::Integrity(
+                                "commit override snapshot mismatch".into(),
+                            ));
+                        }
+                    }
                     for parent in c.parents {
                         self.load::<Commit>(&parent)?;
                     }
@@ -1001,18 +1093,13 @@ impl<B: Backend> Repository<B> {
                 .read_meta(name)?
                 .ok_or_else(|| Error::Integrity(format!("missing {name}")))?;
             let id = parse_pointer(&text)?;
+            self.verify_reference(name, &id)?;
             if name.starts_with("refs/issues/") {
                 let issue = self.load::<IssueEvent>(&id)?;
                 if name != &format!("refs/issues/{}", issue.issue) {
                     return Err(Error::Integrity("issue ref identity mismatch".into()));
                 }
                 self.issue(&issue.issue.to_string())?;
-            } else if name.starts_with("refs/heads/") || name.starts_with("refs/tags/") {
-                self.load::<Commit>(&id)?;
-            } else {
-                return Err(Error::Integrity(format!(
-                    "unsupported ref namespace: {name}"
-                )));
             }
         }
         Ok(FsckReport {
@@ -1020,6 +1107,35 @@ impl<B: Backend> Repository<B> {
             refs: refs.len(),
             pending_transaction: self.backend.read_meta("transaction.json")?.is_some(),
         })
+    }
+
+    pub fn verify_reference(&self, name: &str, id: &ObjectId) -> Result<()> {
+        if let Some(name) = name
+            .strip_prefix("refs/heads/")
+            .or_else(|| name.strip_prefix("refs/tags/"))
+            .or_else(|| name.strip_prefix("refs/remotes/"))
+        {
+            validate_ref_name(name)?;
+            self.load::<Commit>(id)?;
+        } else if name.starts_with("refs/issues/") {
+            if name != format!("refs/issues/{}", self.load::<IssueEvent>(id)?.issue) {
+                return Err(Error::Integrity("issue ref identity mismatch".into()));
+            }
+        } else if name.starts_with("refs/reviews/") {
+            let record = self.load::<ValidationRecord>(id)?;
+            if review_ref(&record.subject)? != name {
+                return Err(Error::Integrity("review ref subject mismatch".into()));
+            }
+        } else if let Some(name) = name.strip_prefix("refs/releases/") {
+            if self.load::<Release>(id)?.name != name {
+                return Err(Error::Integrity("release ref name mismatch".into()));
+            }
+        } else {
+            return Err(Error::Integrity(format!(
+                "unsupported ref namespace {name}"
+            )));
+        }
+        Ok(())
     }
 }
 

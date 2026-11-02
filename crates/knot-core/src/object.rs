@@ -56,6 +56,10 @@ pub enum ObjectKind {
     IssueEvent,
     Interface,
     Dependency,
+    ValidationRecord,
+    TestDefinition,
+    TraceLink,
+    Release,
 }
 impl ObjectKind {
     pub fn as_str(self) -> &'static str {
@@ -68,6 +72,10 @@ impl ObjectKind {
             Self::IssueEvent => "issue_event",
             Self::Interface => "interface",
             Self::Dependency => "dependency",
+            Self::ValidationRecord => "validation_record",
+            Self::TestDefinition => "test_definition",
+            Self::TraceLink => "trace_link",
+            Self::Release => "release",
         }
     }
     pub fn parse(s: &str) -> Result<Self> {
@@ -80,6 +88,10 @@ impl ObjectKind {
             "issue_event" => Ok(Self::IssueEvent),
             "interface" => Ok(Self::Interface),
             "dependency" => Ok(Self::Dependency),
+            "validation_record" => Ok(Self::ValidationRecord),
+            "test_definition" => Ok(Self::TestDefinition),
+            "trace_link" => Ok(Self::TraceLink),
+            "release" => Ok(Self::Release),
             _ => Err(Error::Integrity(format!("unsupported object type: {s}"))),
         }
     }
@@ -220,14 +232,25 @@ pub struct Commit {
     pub author: Option<String>,
     /// UTC seconds since Unix epoch, represented as a decimal string.
     pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<ObjectId>,
 }
 impl StoredObject for Commit {
     const KIND: ObjectKind = ObjectKind::Commit;
+    const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
+    fn schema_version(&self) -> u32 {
+        if self.overrides.is_empty() { 1 } else { 2 }
+    }
     fn validate(&self) -> Result<()> {
         if self.message.trim().is_empty() {
             return Err(Error::Integrity("commit message must not be empty".into()));
         }
         validate_timestamp(&self.timestamp)?;
+        if self.overrides.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(Error::Integrity(
+                "commit override records must be sorted and unique".into(),
+            ));
+        }
         validate_parents(&self.parents)
     }
 }

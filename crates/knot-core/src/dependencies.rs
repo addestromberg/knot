@@ -39,13 +39,23 @@ impl StoredObject for Interface {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DependencyRequirement {
-    Revision { revision: ObjectId },
-    Interface { name: String, interface: ObjectId },
+    Revision {
+        revision: ObjectId,
+    },
+    /// Inclusive ancestry bounds; every acceptable revision descends from minimum.
+    RevisionRange {
+        minimum: ObjectId,
+        maximum: Option<ObjectId>,
+    },
+    Interface {
+        name: String,
+        interface: ObjectId,
+    },
 }
 impl DependencyRequirement {
-    fn name(&self) -> Option<&str> {
+    pub(crate) fn name(&self) -> Option<&str> {
         match self {
-            Self::Revision { .. } => None,
+            Self::Revision { .. } | Self::RevisionRange { .. } => None,
             Self::Interface { name, .. } => Some(name),
         }
     }
@@ -60,6 +70,17 @@ pub struct Dependency {
 }
 impl StoredObject for Dependency {
     const KIND: ObjectKind = ObjectKind::Dependency;
+    const SUPPORTED_VERSIONS: &'static [u32] = &[1, 2];
+    fn schema_version(&self) -> u32 {
+        if matches!(
+            self.requirement,
+            DependencyRequirement::RevisionRange { .. }
+        ) {
+            2
+        } else {
+            1
+        }
+    }
     fn validate(&self) -> Result<()> {
         if self.dependent == self.target {
             return Err(Error::Integrity("an asset cannot depend on itself".into()));
@@ -74,6 +95,10 @@ impl StoredObject for Dependency {
 #[derive(Clone, Debug)]
 pub enum DependencyRequest {
     Revision(Option<ObjectId>),
+    RevisionRange {
+        minimum: ObjectId,
+        maximum: Option<ObjectId>,
+    },
     Interface(String),
 }
 #[derive(Clone, Debug, Serialize)]
@@ -170,6 +195,22 @@ impl<B: Backend> Repository<B> {
         self.load::<Asset>(&dependency.dependent)?;
         self.load::<Asset>(&dependency.target)?;
         match &dependency.requirement {
+            DependencyRequirement::RevisionRange { minimum, maximum } => {
+                for id in std::iter::once(minimum).chain(maximum.iter()) {
+                    if self.load::<Revision>(id)?.asset != dependency.target {
+                        return Err(Error::Integrity(
+                            "revision range belongs to another asset".into(),
+                        ));
+                    }
+                }
+                if let Some(maximum) = maximum
+                    && !self.revision_descends_from(maximum, minimum)?
+                {
+                    return Err(Error::Invalid(
+                        "range maximum must descend from minimum".into(),
+                    ));
+                }
+            }
             DependencyRequirement::Revision { revision } => {
                 if self.load::<Revision>(revision)?.asset != dependency.target {
                     return Err(Error::Integrity(
@@ -352,6 +393,9 @@ impl<B: Backend> Repository<B> {
             return Err(Error::Invalid("an asset cannot depend on itself".into()));
         }
         let requirement = match request {
+            DependencyRequest::RevisionRange { minimum, maximum } => {
+                DependencyRequirement::RevisionRange { minimum, maximum }
+            }
             DependencyRequest::Revision(pin) => DependencyRequirement::Revision {
                 revision: pin.unwrap_or(target_revision),
             },
@@ -465,6 +509,21 @@ impl<B: Backend> Repository<B> {
                 let mut selected_interface = None;
                 let status = if let Some(selected) = selected {
                     match &dependency.requirement {
+                        DependencyRequirement::RevisionRange { minimum, maximum } => {
+                            if self.revision_descends_from(&selected.revision, minimum)?
+                                && maximum
+                                    .as_ref()
+                                    .map(|maximum| {
+                                        self.revision_descends_from(maximum, &selected.revision)
+                                    })
+                                    .transpose()?
+                                    .unwrap_or(true)
+                            {
+                                RequirementStatus::Satisfied
+                            } else {
+                                RequirementStatus::RevisionMismatch
+                            }
+                        }
                         DependencyRequirement::Revision { revision } => {
                             if selected.revision == *revision {
                                 RequirementStatus::Satisfied
@@ -626,7 +685,8 @@ impl<B: Backend> Repository<B> {
                     true
                 } else {
                     match &edge.requirement {
-                        DependencyRequirement::Revision { .. } => {
+                        DependencyRequirement::Revision { .. }
+                        | DependencyRequirement::RevisionRange { .. } => {
                             before.map(|n| &n.revision) != after.map(|n| &n.revision)
                         }
                         DependencyRequirement::Interface { name, .. } => {

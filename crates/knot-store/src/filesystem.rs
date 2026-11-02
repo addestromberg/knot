@@ -12,6 +12,11 @@ pub(crate) struct Config {
     pub format_version: u32,
     pub hash: String,
     pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bare: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 pub struct FsBackend {
@@ -22,6 +27,16 @@ pub struct FsBackend {
 }
 
 impl FsBackend {
+    pub fn init_bare(path: impl AsRef<Path>, author: Option<String>) -> Result<Self> {
+        let mut backend = Self::init(path, author)?;
+        backend.config.bare = true;
+        backend.config.format_version = 3;
+        backend.write_metadata(
+            "config.toml",
+            Some(&toml::to_string(&backend.config).map_err(|e| Error::Integrity(e.to_string()))?),
+        )?;
+        Ok(backend)
+    }
     pub fn init(path: impl AsRef<Path>, author: Option<String>) -> Result<Self> {
         fs::create_dir_all(path.as_ref())?;
         let root = fs::canonicalize(path)?;
@@ -56,6 +71,7 @@ impl FsBackend {
                 format_version: 1,
                 hash: "sha256".into(),
                 author,
+                bare: false,
             },
             _lock: lock,
         };
@@ -126,7 +142,7 @@ impl FsBackend {
         let config_path = checked_join(&meta, "config.toml")?;
         let config: Config = toml::from_str(&fs::read_to_string(config_path)?)
             .map_err(|e| Error::Integrity(format!("invalid config.toml: {e}")))?;
-        if ![1, 2].contains(&config.format_version) || config.hash != "sha256" {
+        if ![1, 2, 3].contains(&config.format_version) || config.hash != "sha256" {
             return Err(Error::Integrity(
                 "unsupported repository format or hash algorithm".into(),
             ));
@@ -139,16 +155,19 @@ impl FsBackend {
         })
     }
     pub(crate) fn ensure_m2_format(&self) -> Result<()> {
+        self.ensure_format(2)
+    }
+    pub(crate) fn ensure_format(&self, minimum: u32) -> Result<()> {
         let text = self
             .read_metadata("config.toml")?
             .ok_or_else(|| Error::Integrity("missing config.toml".into()))?;
         let mut config: Config =
             toml::from_str(&text).map_err(|e| Error::Integrity(e.to_string()))?;
-        if ![1, 2].contains(&config.format_version) {
+        if ![1, 2, 3].contains(&config.format_version) {
             return Err(Error::Integrity("unsupported repository format".into()));
         }
-        if config.format_version == 1 {
-            config.format_version = 2;
+        if config.format_version < minimum {
+            config.format_version = minimum;
             self.write_metadata(
                 "config.toml",
                 Some(&toml::to_string(&config).map_err(|e| Error::Integrity(e.to_string()))?),
@@ -210,7 +229,19 @@ impl FsBackend {
     }
     pub(crate) fn list_metadata(&self, prefix: &str) -> Result<Vec<String>> {
         let prefix = prefix.trim_end_matches('/');
-        if !["refs", "refs/heads", "refs/tags", "refs/issues", "logs"].contains(&prefix) {
+        if ![
+            "refs",
+            "refs/heads",
+            "refs/tags",
+            "refs/issues",
+            "refs/reviews",
+            "refs/releases",
+            "refs/remotes",
+            "remotes",
+            "logs",
+        ]
+        .contains(&prefix)
+        {
             return Err(Error::Invalid("unsupported metadata listing".into()));
         }
         let mut out = Vec::new();
@@ -304,10 +335,20 @@ fn validate_meta_name(name: &str) -> Result<()> {
     if ["HEAD", "index", "config.toml", "transaction.json"].contains(&name) {
         return Ok(());
     }
-    for prefix in ["refs/heads/", "refs/tags/"] {
+    for prefix in [
+        "refs/heads/",
+        "refs/tags/",
+        "refs/releases/",
+        "refs/remotes/",
+        "remotes/",
+    ] {
         if let Some(tail) = name.strip_prefix(prefix) {
             return validate_ref_name(tail);
         }
+    }
+    if let Some(tail) = name.strip_prefix("refs/reviews/") {
+        tail.parse::<knot_core::ObjectId>()?;
+        return Ok(());
     }
     if let Some(tail) = name.strip_prefix("refs/issues/") {
         let id = uuid::Uuid::parse_str(tail).map_err(|e| Error::Integrity(e.to_string()))?;
@@ -336,6 +377,9 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 }
 
 impl Backend for FsBackend {
+    fn is_bare(&self) -> bool {
+        self.config.bare
+    }
     fn author(&self) -> Result<Option<String>> {
         Ok(self.config.author.clone())
     }

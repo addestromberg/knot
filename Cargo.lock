@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "knot-cli"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "knot-core",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "knot-core"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -372,8 +372,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "knot-mcp"
+version = "0.6.0"
+dependencies = [
+ "clap",
+ "knot-core",
+ "knot-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "knot-store"
-version = "0.2.0"
+version = "0.6.0"
 dependencies = [
  "ignore",
  "knot-core",

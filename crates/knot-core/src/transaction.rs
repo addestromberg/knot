@@ -1,6 +1,6 @@
 use crate::{
-    Backend, Commit, Error, FileState, IssueEvent, Repository, Result, Snapshot, canonical,
-    parse_pointer, validate_path, validate_ref_name,
+    Backend, Commit, Error, FileState, Repository, Result, Snapshot, canonical, parse_pointer,
+    validate_path, validate_ref_name,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -126,25 +126,10 @@ impl<B: Backend> Repository<B> {
                     let id = parse_pointer(value)?;
                     if change.name == "index" {
                         self.load::<Snapshot>(&id)?;
-                    } else if let Some(issue_id) = change.name.strip_prefix("refs/issues/") {
-                        if self.load::<IssueEvent>(&id)?.issue.to_string() != issue_id {
-                            return Err(Error::Integrity(
-                                "transaction issue identity mismatch".into(),
-                            ));
-                        }
                     } else if change.name == "HEAD" {
                         self.load::<Commit>(&id)?;
-                    } else if let Some(name) = change
-                        .name
-                        .strip_prefix("refs/heads/")
-                        .or_else(|| change.name.strip_prefix("refs/tags/"))
-                    {
-                        validate_ref_name(name)?;
-                        self.load::<Commit>(&id)?;
                     } else {
-                        return Err(Error::Integrity(
-                            "unsupported transaction ref namespace".into(),
-                        ));
+                        self.verify_reference(&change.name, &id)?;
                     }
                 }
             }

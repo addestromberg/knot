@@ -6,11 +6,155 @@ use knot_core::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
+fn validate_payload(kind: ObjectKind, version: u32, bytes: &[u8]) -> Result<()> {
+    fn check<T: knot_core::StoredObject>(version: u32, bytes: &[u8]) -> Result<()> {
+        if !T::SUPPORTED_VERSIONS.contains(&version) {
+            return Err(Error::Integrity("unsupported transferred schema".into()));
+        }
+        let value: T = serde_json::from_slice(bytes)?;
+        if value.schema_version() != version || knot_core::canonical(&value)? != bytes {
+            return Err(Error::Integrity("noncanonical transferred object".into()));
+        }
+        value.validate()
+    }
+    match kind {
+        ObjectKind::Asset => check::<knot_core::Asset>(version, bytes),
+        ObjectKind::Revision => check::<knot_core::Revision>(version, bytes),
+        ObjectKind::Snapshot => check::<knot_core::Snapshot>(version, bytes),
+        ObjectKind::Commit => check::<knot_core::Commit>(version, bytes),
+        ObjectKind::IssueEvent => check::<knot_core::IssueEvent>(version, bytes),
+        ObjectKind::Interface => check::<knot_core::Interface>(version, bytes),
+        ObjectKind::Dependency => check::<knot_core::Dependency>(version, bytes),
+        ObjectKind::ValidationRecord => check::<knot_core::ValidationRecord>(version, bytes),
+        ObjectKind::TestDefinition => check::<knot_core::TestDefinition>(version, bytes),
+        ObjectKind::TraceLink => check::<knot_core::TraceLink>(version, bytes),
+        ObjectKind::Release => check::<knot_core::Release>(version, bytes),
+        ObjectKind::Blob => Ok(()),
+    }
+}
+
 impl FsBackend {
+    /// Export the canonical envelope and payload, streaming blobs without buffering.
+    pub fn export_object(&self, id: &ObjectId, out: &mut impl Write) -> Result<u64> {
+        let (mut file, kind, _, len, header) = self.open_object(id)?;
+        if kind == ObjectKind::Blob {
+            self.check_blob(id)?;
+        } else {
+            self.read_object(id)?;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let total = header.len() as u64 + len;
+        if std::io::copy(&mut file.take(total), out)? != total {
+            return Err(Error::Integrity("object changed while exporting".into()));
+        }
+        Ok(total)
+    }
+    pub fn object_size(&self, id: &ObjectId) -> Result<u64> {
+        let (_, _, _, len, header) = self.open_object(id)?;
+        Ok(len + header.len() as u64)
+    }
+    /// Import an exact framed object, verify its hash/header/schema, then publish atomically.
+    pub fn import_object(&self, id: &ObjectId, len: u64, input: &mut impl Read) -> Result<()> {
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(checked_join(&self.meta, "objects/sha256")?)?;
+        let mut remaining = len;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        while remaining > 0 {
+            let wanted = remaining.min(buffer.len() as u64) as usize;
+            let count = input.read(&mut buffer[..wanted])?;
+            if count == 0 {
+                return Err(Error::Integrity("truncated object transfer".into()));
+            }
+            temporary.write_all(&buffer[..count])?;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        if ObjectId::from_digest(hash.finalize().into()) != *id {
+            return Err(Error::Integrity(format!(
+                "transferred object {id} has wrong hash"
+            )));
+        }
+        temporary.as_file_mut().seek(SeekFrom::Start(0))?;
+        let mut header = Vec::new();
+        let mut separators = 0;
+        while separators < 4 {
+            let mut byte = [0];
+            temporary.as_file_mut().read_exact(&mut byte)?;
+            header.push(byte[0]);
+            if byte[0] == 0 {
+                separators += 1;
+            }
+            if header.len() > 128 {
+                return Err(Error::Integrity("invalid transferred object header".into()));
+            }
+        }
+        let fields: Vec<_> = header.split(|b| *b == 0).collect();
+        let field = |index: usize| {
+            std::str::from_utf8(fields[index]).map_err(|e| Error::Integrity(e.to_string()))
+        };
+        let kind = ObjectKind::parse(field(1)?)?;
+        let version: u32 = field(2)?
+            .parse()
+            .map_err(|_| Error::Integrity("invalid object version".into()))?;
+        let payload_len: u64 = field(3)?
+            .parse()
+            .map_err(|_| Error::Integrity("invalid object length".into()))?;
+        if fields[0] != b"knot"
+            || object_header_versioned(kind, version, payload_len) != header
+            || (header.len() as u64).checked_add(payload_len) != Some(len)
+        {
+            return Err(Error::Integrity(
+                "noncanonical transferred object envelope".into(),
+            ));
+        }
+        if kind == ObjectKind::Blob {
+            if version != 1 {
+                return Err(Error::Integrity("unsupported blob schema".into()));
+            }
+        } else {
+            if payload_len > knot_core::MAX_STRUCTURED_OBJECT_SIZE as u64 {
+                return Err(Error::Integrity("structured object too large".into()));
+            }
+            let mut bytes = Vec::new();
+            temporary.as_file_mut().read_to_end(&mut bytes)?;
+            validate_payload(kind, version, &bytes)?;
+        }
+        if matches!(
+            kind,
+            ObjectKind::ValidationRecord
+                | ObjectKind::TestDefinition
+                | ObjectKind::TraceLink
+                | ObjectKind::Release
+        ) || version == 2 && matches!(kind, ObjectKind::Dependency | ObjectKind::Commit)
+        {
+            self.ensure_format(3)?;
+        } else if version == 2 || matches!(kind, ObjectKind::Dependency | ObjectKind::Interface) {
+            self.ensure_m2_format()?;
+        }
+        let destination = self.object_path(id)?;
+        if destination.exists() {
+            if kind == ObjectKind::Blob {
+                self.check_blob(id)?;
+            } else {
+                self.read_object(id)?;
+            }
+            return Ok(());
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Integrity("missing object parent".into()))?;
+        fs::create_dir_all(parent)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist_noclobber(&destination)
+            .map_err(|e| Error::Io(e.error))?;
+        sync_directory_chain(parent, &self.meta)
+    }
     pub(crate) fn object_path(&self, id: &ObjectId) -> Result<std::path::PathBuf> {
         let text = id.as_str();
         checked_join(
@@ -27,7 +171,13 @@ impl FsBackend {
         version: u32,
         payload: &[u8],
     ) -> Result<ObjectId> {
-        if version != 1 && !(version == 2 && kind == ObjectKind::Revision) {
+        if version != 1
+            && !(version == 2
+                && matches!(
+                    kind,
+                    ObjectKind::Revision | ObjectKind::Dependency | ObjectKind::Commit
+                ))
+        {
             return Err(Error::Integrity("unsupported object schema".into()));
         }
         if kind != ObjectKind::Blob && payload.len() > knot_core::MAX_STRUCTURED_OBJECT_SIZE {
@@ -35,7 +185,16 @@ impl FsBackend {
                 "structured object exceeds 16 MiB limit".into(),
             ));
         }
-        if version == 2 || matches!(kind, ObjectKind::Dependency | ObjectKind::Interface) {
+        if matches!(
+            kind,
+            ObjectKind::ValidationRecord
+                | ObjectKind::TestDefinition
+                | ObjectKind::TraceLink
+                | ObjectKind::Release
+        ) || version == 2 && matches!(kind, ObjectKind::Dependency | ObjectKind::Commit)
+        {
+            self.ensure_format(3)?;
+        } else if version == 2 || matches!(kind, ObjectKind::Dependency | ObjectKind::Interface) {
             self.ensure_m2_format()?;
         }
         let id = object_id_versioned(kind, version, payload);
@@ -96,7 +255,13 @@ impl FsBackend {
             .map_err(|e| Error::Integrity(e.to_string()))?
             .parse()
             .map_err(|_| Error::Integrity("invalid schema version".into()))?;
-        if version != 1 && !(version == 2 && kind == ObjectKind::Revision) {
+        if version != 1
+            && !(version == 2
+                && matches!(
+                    kind,
+                    ObjectKind::Revision | ObjectKind::Dependency | ObjectKind::Commit
+                ))
+        {
             return Err(Error::Integrity("unsupported object schema version".into()));
         }
         let len: u64 = std::str::from_utf8(fields[3])

@@ -48,6 +48,285 @@ fn human(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn override_guards_are_per_dependency_and_commit_history_marks_accepted_overrides() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init"]);
+    for name in ["pipe", "rod", "assembly"] {
+        fs::write(root.join(name), name).unwrap();
+    }
+    ok(root, &["add", "."]);
+    ok(root, &["depend", "add", "rod", "--on", "pipe"]);
+    ok(root, &["depend", "add", "assembly", "--on", "rod"]);
+    ok(root, &["commit", "-m", "Initial"]);
+    fs::write(root.join("pipe"), "new pipe").unwrap();
+    ok(root, &["add", "pipe"]);
+    let before = ok(root, &["status"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("-C")
+        .arg(root)
+        .arg("rape")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"n\nn\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("[y/N]")
+            .count(),
+        2
+    );
+    assert_eq!(
+        ok(root, &["status"])["staged_snapshot"],
+        before["staged_snapshot"]
+    );
+    let overridden = ok(
+        root,
+        &[
+            "rape",
+            "--forced",
+            "--reviewer",
+            "Operator",
+            "--notes",
+            "Accept selected revisions",
+        ],
+    );
+    assert_eq!(overridden["accepted"], 2);
+    assert_eq!(ok(root, &["status"])["requirements_satisfied"], true);
+    assert!(human(root, &["status"]).contains("verified (raped)"));
+    ok(root, &["commit", "-m", "Accept new assembly"]);
+    let history = ok(root, &["log"]);
+    assert_eq!(
+        history[0]["commit"]["overrides"].as_array().unwrap().len(),
+        2
+    );
+    assert!(human(root, &["log"]).contains("(raped)"));
+    fs::write(root.join("notes.md"), "Unrelated note").unwrap();
+    ok(root, &["add", "notes.md"]);
+    ok(root, &["commit", "-m", "Keep accepted configuration"]);
+    assert_eq!(
+        ok(root, &["log"])[0]["commit"]["overrides"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    ok(root, &["fsck"]);
+}
+
+#[test]
+fn cli_manual_validation_release_and_local_peer_workflow() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    ok(&source, &["init"]);
+    for (name, body) in [("pipe", "pipe"), ("rod", "rod"), ("fit.md", "Measure fit")] {
+        fs::write(source.join(name), body).unwrap();
+    }
+    ok(&source, &["add", "."]);
+    ok(&source, &["depend", "add", "rod", "--on", "pipe"]);
+    ok(
+        &source,
+        &[
+            "tests",
+            "define",
+            "fit",
+            "--procedure",
+            "fit.md",
+            "--input",
+            "pipe",
+            "--input",
+            "rod",
+        ],
+    );
+    ok(&source, &["commit", "-m", "Tested assembly"]);
+    assert_eq!(
+        run(&source, &["release", "create", "v1", "--approver", "A"])
+            .status
+            .code(),
+        Some(3)
+    );
+    ok(
+        &source,
+        &[
+            "verify",
+            "rod",
+            "--on",
+            "pipe",
+            "--reviewer",
+            "Engineer",
+            "--notes",
+            "Measured clearance",
+        ],
+    );
+    ok(
+        &source,
+        &[
+            "validate",
+            "fit",
+            "--record",
+            "passed",
+            "--reviewer",
+            "Engineer",
+            "--notes",
+            "Fit passed",
+        ],
+    );
+    ok(&source, &["release", "create", "v1", "--approver", "A"]);
+    let peer = root.join("peer");
+    ok(root, &["init", peer.to_str().unwrap(), "--bare"]);
+    ok(
+        &source,
+        &["remote", "add", "origin", peer.to_str().unwrap()],
+    );
+    ok(&source, &["push"]);
+    let copy = root.join("copy");
+    ok(
+        root,
+        &["clone", peer.to_str().unwrap(), copy.to_str().unwrap()],
+    );
+    assert_eq!(
+        ok(&copy, &["status"])["head"],
+        ok(&source, &["status"])["head"]
+    );
+    assert_eq!(fs::read_to_string(copy.join("pipe")).unwrap(), "pipe");
+    ok(&copy, &["checkout", "release/v1", "--validated"]);
+    assert_eq!(ok(&copy, &["release", "list"]).as_array().unwrap().len(), 1);
+    ok(&copy, &["fsck"]);
+}
+
+#[test]
+fn ssh_endpoint_advertises_framed_objects_and_rejects_unauthorized_uploads() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init"]);
+    fs::write(root.join("file"), "contents").unwrap();
+    ok(root, &["add", "."]);
+    ok(root, &["commit", "-m", "One"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("-C")
+        .arg(root)
+        .args(["serve", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    input.write_all(b"{\"operation\":\"advertise\"}\n").unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let inventory: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(inventory["ok"], true);
+    let object = &inventory["data"]["objects"][0];
+    writeln!(input, "{}", json!({"operation":"get","objects":[object]})).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let frames: Value = serde_json::from_str(&line).unwrap();
+    let len = frames["data"][0]["len"].as_u64().unwrap();
+    let mut raw = vec![0; len as usize];
+    output.read_exact(&mut raw).unwrap();
+    assert!(raw.starts_with(b"knot\0"));
+    input
+        .write_all(b"{\"operation\":\"put\",\"objects\":[],\"updates\":[]}\n")
+        .unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let denied: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(denied["ok"], false);
+    assert!(
+        denied["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read-only")
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn writable_peer_endpoint_streams_objects_and_publishes_refs_after_verification() {
+    use knot_core::{Backend, Repository};
+    use knot_store::FsBackend;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("source");
+    let destination = dir.path().join("peer");
+    ok(dir.path(), &["init", source_path.to_str().unwrap()]);
+    ok(
+        dir.path(),
+        &["init", destination.to_str().unwrap(), "--bare"],
+    );
+    fs::write(source_path.join("binary"), b"engineering\0object\xff").unwrap();
+    ok(&source_path, &["add", "."]);
+    ok(&source_path, &["commit", "-m", "Transfer fixture"]);
+    let source = Repository::open(FsBackend::open(&source_path).unwrap()).unwrap();
+    let ids = source.backend().list_objects().unwrap();
+    let frames = ids
+        .iter()
+        .map(|id| json!({"id":id,"len":source.backend().object_size(id).unwrap()}))
+        .collect::<Vec<_>>();
+    let updates = source
+        .reference_inventory()
+        .unwrap()
+        .into_iter()
+        .map(|(name, id)| json!({"name":name,"before":null,"after":id}))
+        .collect::<Vec<_>>();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("-C")
+        .arg(&destination)
+        .args(["serve", "--stdio", "--allow-writes"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        input,
+        "{}",
+        json!({"operation":"put","objects":frames,"updates":updates})
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["data"]["ready"],
+        true
+    );
+    for id in &ids {
+        source.backend().export_object(id, &mut input).unwrap();
+    }
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["ok"], true, "{response}");
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    let peer = Repository::open(FsBackend::open(&destination).unwrap()).unwrap();
+    assert_eq!(peer.head_id().unwrap(), source.head_id().unwrap());
+    assert!(!destination.join("binary").exists());
+    peer.fsck().unwrap();
+}
+
+#[test]
 fn status_displays_staged_graph_and_warns_about_unstaged_edits() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -158,7 +437,7 @@ fn interface_cycles_render_finitely_and_show_changed_contract_versions() {
         );
     }
     ok(root, &["commit", "-m", "Mutual fit declarations"]);
-    let output = human(root, &["status"]);
+    let output = human(root, &["graph"]);
     assert!(output.contains("(cycle)"));
     assert_eq!(output.matches("pipe.step").count(), 1);
     assert_eq!(output.matches("rod.step").count(), 1);

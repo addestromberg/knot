@@ -23,6 +23,9 @@ impl FaultBackend {
     }
 }
 impl Backend for FaultBackend {
+    fn is_bare(&self) -> bool {
+        self.inner.is_bare()
+    }
     fn author(&self) -> Result<Option<String>> {
         self.inner.author()
     }
@@ -89,6 +92,39 @@ fn seed(root: &std::path::Path) -> (ObjectId, ObjectId) {
     repo.add(&[".".into()]).unwrap();
     let second = repo.commit("Second").unwrap();
     (first, second)
+}
+
+#[test]
+fn synchronized_ref_publication_recovers_after_each_durable_write() {
+    for boundary in 1..=4 {
+        let dir = tempdir().unwrap();
+        let (_, head) = seed(dir.path());
+        let backend = FaultBackend {
+            inner: FsBackend::open(dir.path()).unwrap(),
+            remaining: Cell::new(Some(boundary)),
+        };
+        let repo = Repository::open(backend).unwrap();
+        let _ = repo.publish_references(
+            &[ReferenceUpdate {
+                name: "refs/remotes/peer/main".into(),
+                before: None,
+                after: head.clone(),
+            }],
+            None,
+            false,
+        );
+        drop(repo);
+        let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+        if repo.status().unwrap().recovery_required {
+            repo.recover(false).unwrap();
+        }
+        assert_eq!(
+            repo.backend().read_meta("refs/remotes/peer/main").unwrap(),
+            Some(format!("{head}\n"))
+        );
+        assert_eq!(repo.head_id().unwrap(), Some(head));
+        repo.fsck().unwrap();
+    }
 }
 
 #[test]

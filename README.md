@@ -2,7 +2,7 @@
 
 Knot is an offline-first engineering version control system written in Rust. It stores immutable, SHA-256-addressed objects in `.knot/`, tracks stable asset identities, and maintains repository-local issues without a database or hosted service.
 
-M1 and M2 implement filesystem versioning, basic issues, versioned dependencies and interfaces, exact requirement checks, and impact analysis. Automatic compatible revision selection, engineering test execution/results, MCP/Skills, remotes, and a React frontend remain planned.
+M1–M6 implement filesystem versioning, local issues, dependency graphs, deterministic compatible revision selection, manual verification, traceability, releases, MCP/skills, and filesystem/SSH peer synchronization. An optional Tailscale adapter supplies automatic mesh connectivity. The CLI is the application interface; no UI or hosted platform is planned. Geometry interpretation and automated engineering test runners remain optional future extensions.
 
 ## Build and check
 
@@ -15,6 +15,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p knot-cli -- --help
 cargo install --path crates/knot-cli --locked
+cargo install --path crates/knot-mcp --locked
 ```
 
 Dependencies require an initial download; repository operations themselves never access the network. After `cargo fetch --locked`, builds can also use `--offline`.
@@ -68,7 +69,10 @@ Dependency graph (staged; parent depends on child)
 
 2 tracked files · 1 dependency · 1 conflict
 WARNING: unsatisfied requirements block ordinary commits.
-Requirements are declarations; manual verification is not yet recorded.
+Matching requirements do not establish engineering verification.
+
+Verification:
+  [STALE] rod.step -> pipe.step
 ```
 
 Revision IDs above are illustrative. `[matches]` means an exact requirement matches, not that an engineering check passed. Unstaged edits are marked and produce a warning because checks use staging. `knot graph` uses the same tree presentation; `graph --at <ref>` inspects history. `status --json` retains its versioned envelope and existing fields, and adds `data.dependency_graph` with the complete staged graph and full object IDs. `graph --json` retains its existing report.
@@ -110,13 +114,62 @@ knot depend remove electronics/controller.kicad_pcb --on mechanical/housing.FCSt
 
 `depend add` replaces an existing requirement for the same target and kind/name. `depend remove --on <asset>` removes all requirements on that target; `--interface <name>` removes only that named requirement. `interface remove <asset> --name <name>` stages removal of an export and may leave dependents unsatisfied.
 
-`impact <asset>` lists potential direct and transitive dependents. `impact <asset> --since <ref>` compares staged state with a committed baseline, distinguishes content/interface/constraint/path changes, and excludes direct consumers of unchanged interface versions. Transitive entries are conservative review candidates. Neither command executes tests or declares existing evidence stale; validation is M4 work.
+`impact <asset>` lists potential direct and transitive dependents. `impact <asset> --since <ref>` compares staged state with a committed baseline, distinguishes content/interface/constraint/path changes, and excludes direct consumers of unchanged interface versions. Transitive entries are conservative review candidates. These queries describe declared-contract impact; status separately reports manual review applicability, even when an interface declaration stays unchanged.
 
 Graph edge statuses are `satisfied`, `missing_asset`, `revision_mismatch`, `missing_interface`, and `interface_mismatch`. Reports set `declarations_only: true`: satisfying a declaration does not prove CAD fit or electrical compatibility. Unchanged exported interfaces are maintained explicitly by the user; Knot does not extract geometry or pin mappings.
 
 Commits and exact checkouts reject unsatisfied declarations with exit 3 and JSON code `dependency_conflict`, including conflicting edges in `error.details.conflicts`. Staging can be incomplete while you work. To deliberately save/restore a work-in-progress configuration, supply `commit --allow-incompatible` or `checkout --allow-incompatible`. These flags do not bypass dirty-file protection or integrity checks.
 
 Existing M1 repositories remain readable and their object hashes stay unchanged. The first M2 object write atomically raises the repository format marker to 2 before publishing engineering objects. Older M1 binaries then refuse to open it. This capability marker is not downgraded by checkout or abort; historical objects are never rewritten. See [engineering graph design](docs/engineering-graph.md).
+
+## Resolve, verify, and release
+
+```sh
+knot resolve --pin mechanical/pipe.step@<full-revision-hash>
+knot resolve --pin mechanical/pipe.step@<full-revision-hash> --apply
+knot verify mechanical/rod.step --on mechanical/pipe.step --reviewer "Engineer" \
+  --notes "Inspected bore and clearance"
+knot validate --affected
+knot commit -m "Record reviewed assembly"
+knot release create v1.0 --approver "Engineer"
+```
+
+Resolution previews by default. Application stages a configuration and leaves HEAD
+unchanged. Reviews bind exact inputs independently of snapshots; modified inputs
+make prior evidence stale. Unresolved upstream reviews appear in status.
+
+`knot rape` explicitly overrides dependency reviews with a guard for each
+relationship; `--forced` accepts every guard. It rebinds accepted requirements,
+keeps immutable override records, and labels commits using them `(raped)` in
+`knot log`. This does not record execution of an engineering test. See the
+[verification guide](docs/verification.md) for test definitions and release policy.
+
+## Synchronize with peers
+
+```sh
+knot init /srv/knot/project --bare
+knot remote add origin /srv/knot/project
+knot push
+knot clone /srv/knot/project ./copy
+knot fetch
+knot pull
+```
+
+Use `ssh://user@host/absolute/path` for authenticated SSH peers. Optional
+`knot peer discover` finds LAN announcements. For automatic WireGuard-based
+connectivity without port forwarding, install/authorize Tailscale and use:
+
+```sh
+knot peer mesh-up --ssh
+knot peer discover --mesh
+knot peer connect workshop --host workshop --user engineer \
+  --repository /home/engineer/project
+knot push workshop
+```
+
+Mesh coordination/relay services are optional and separate from core repository
+operations. Plain local and reachable SSH peers need no such service. See the
+[synchronization guide](docs/synchronization.md) for access policies and limits.
 
 ## Restore and recover
 
@@ -164,7 +217,7 @@ Issue history lives under its own refs and remains current across engineering ch
 
 ## Automation and platform boundaries
 
-Every operation supports `--json`, returning one envelope with `schema_version: 1`, `ok`, and either `data` or `error`. Errors contain stable `code`, `message`, and `details` fields. Machine output goes to stdout; human diagnostics go to stderr. Without `--json`, results are pretty-printed JSON; help is conventional CLI text.
+Every operation supports `--json`, returning one envelope with `schema_version: 1`, `ok`, and either `data` or `error`. Errors contain stable `code`, `message`, and `details` fields. Machine output goes to stdout; human diagnostics go to stderr. Without `--json`, status/graph/history use readable terminal output; other results use pretty-printed JSON. Help uses conventional CLI text.
 
 | Exit | Meaning |
 |---|---|
@@ -181,4 +234,4 @@ Use a local filesystem supporting locks and atomic file replacement. File conten
 
 ## Design and contribution
 
-See [Repository Guidelines](AGENTS.md), [product specification](docs/specification.md), [architecture decisions](docs/architecture.md), [repository format](docs/format.md), and [dependency policy](docs/dependencies.md), and [engineering graph design](docs/engineering-graph.md).
+See [compatible resolution](docs/resolution.md), [manual verification and overrides](docs/verification.md), [MCP and skills](docs/mcp.md), [peer synchronization and mesh networking](docs/synchronization.md), [Repository Guidelines](AGENTS.md), [product specification](docs/specification.md), [architecture decisions](docs/architecture.md), [repository format](docs/format.md), and [dependency policy](docs/dependencies.md), and [engineering graph design](docs/engineering-graph.md).

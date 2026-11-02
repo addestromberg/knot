@@ -11,6 +11,9 @@ pub struct FileState {
 /// A backend holds an exclusive repository lock for its entire lifetime.
 /// Paths are portable, root-relative, and must never follow symbolic links.
 pub trait Backend {
+    fn is_bare(&self) -> bool {
+        false
+    }
     fn author(&self) -> Result<Option<String>>;
     fn read_meta(&self, name: &str) -> Result<Option<String>>;
     fn write_meta(&self, name: &str, content: Option<&str>) -> Result<()>;

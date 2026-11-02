@@ -57,6 +57,48 @@ pub fn status(out: &mut impl Write, status: &Status) -> io::Result<()> {
     }
     writeln!(out)?;
     graph_inner(out, &status.dependency_graph, Some(status))?;
+    if !status.verification.dependencies.is_empty()
+        || !status.verification.tests.is_empty()
+        || !status.verification.assets.is_empty()
+    {
+        writeln!(out, "\nVerification:")?;
+        for entry in status
+            .verification
+            .dependencies
+            .iter()
+            .chain(&status.verification.tests)
+            .chain(&status.verification.assets)
+        {
+            let label = match entry.state {
+                knot_core::VerificationState::Verified => {
+                    if entry.overridden {
+                        "verified (raped)"
+                    } else {
+                        "verified"
+                    }
+                }
+                knot_core::VerificationState::Unverified => "unverified",
+                knot_core::VerificationState::Stale => "STALE",
+                knot_core::VerificationState::Failed => "FAILED",
+                knot_core::VerificationState::Error => "ERROR",
+            };
+            let target = entry
+                .target_path
+                .as_deref()
+                .map(|p| format!(" -> {}", text(p)))
+                .unwrap_or_default();
+            writeln!(out, "  [{label}] {}{target}", text(&entry.path))?;
+        }
+        for warning in &status.verification.upstream {
+            writeln!(
+                out,
+                "  [unverified upstream] {} — dependency {} -> {} needs review",
+                text(&warning.path),
+                short(&warning.dependent),
+                short(&warning.target)
+            )?;
+        }
+    }
     if !status.unstaged.is_empty() {
         writeln!(
             out,
@@ -80,8 +122,40 @@ pub fn graph(out: &mut impl Write, graph: &GraphReport) -> io::Result<()> {
     graph_inner(out, graph, None)
 }
 
+pub fn history(out: &mut impl Write, history: &[knot_core::HistoryEntry]) -> io::Result<()> {
+    if history.is_empty() {
+        writeln!(out, "No commits.")?;
+    }
+    for entry in history {
+        let marker = if entry.commit.overrides.is_empty() {
+            ""
+        } else {
+            " (raped)"
+        };
+        writeln!(out, "commit {}{marker}", entry.id)?;
+        if let Some(author) = &entry.commit.author {
+            writeln!(out, "Author: {}", text(author))?;
+        }
+        writeln!(
+            out,
+            "Time: {}\n\n    {}\n",
+            entry.commit.timestamp,
+            text(&entry.commit.message)
+        )?;
+    }
+    Ok(())
+}
+
 fn requirement(edge: &DependencyEdge) -> String {
     let required = match &edge.requirement {
+        DependencyRequirement::RevisionRange { minimum, maximum } => format!(
+            "requires @{}..{}",
+            short(minimum),
+            maximum
+                .as_ref()
+                .map(short)
+                .unwrap_or_else(|| "latest".into())
+        ),
         DependencyRequirement::Revision { revision } => format!("requires @{}", short(revision)),
         DependencyRequirement::Interface { name, interface } => {
             format!("requires {}@{}", text(name), short(interface))
@@ -284,6 +358,6 @@ fn graph_inner(
     }
     writeln!(
         out,
-        "Requirements are declarations; manual verification is not yet recorded."
+        "Matching requirements do not establish engineering verification."
     )
 }

@@ -111,6 +111,9 @@ impl FsBackend {
         Ok(Some(FileState { blob, executable }))
     }
     pub(crate) fn restore_file(&self, relative: &str, state: Option<&FileState>) -> Result<()> {
+        if self.config.bare {
+            return Err(Error::Invalid("bare repository has no working tree".into()));
+        }
         validate_path(relative)?;
         let path = checked_join(&self.root, relative)?;
         if let Some(state) = state {

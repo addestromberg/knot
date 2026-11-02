@@ -1,6 +1,6 @@
 # Dependency policy
 
-Verified on 2026-11-02 against crates.io's `max_stable_version` and Rust's stable release manifest. Rust 1.99.1 is the current stable toolchain and is pinned in `rust-toolchain.toml`. All direct dependencies selected for M1 use their latest stable release; there are no intentional older-version exceptions. Rechecked for M2 on the same date: no newer stable direct releases or compatible lockfile updates were found, and M2 adds no external dependencies.
+Verified on 2026-11-02 against crates.io's `max_stable_version` and Rust's stable release manifest. Rust 1.99.1 is the current stable toolchain and is pinned in `rust-toolchain.toml`. All direct dependencies selected for M1 use their latest stable release; there are no intentional older-version exceptions. Rechecked for M2 on the same date: no newer stable direct releases or compatible lockfile updates were found, and M2 adds no external dependencies. Rechecked again for M3–M6 on the same date: all direct stable versions still match, and no new external Rust dependencies were added. OpenSSH and Tailscale are optional runtime transport programs, not dependencies of core operations.
 
 | Dependency | Stable release checked | Purpose |
 |---|---|---|
