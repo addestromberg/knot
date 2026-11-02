@@ -6,6 +6,13 @@ Status: M1–M6 implemented; readable repository capability markers 1, 2, and 3.
 
 All backend functionality is Rust. `knot-core` contains typed objects, portable path rules, structured errors, the `Backend` trait, and `Repository<B>` domain operations. `knot-store` implements that trait with a filesystem and holds a repository lock for its lifetime. `knot-cli` parses commands, resolves operation-relative paths, and renders results. `knot-mcp` uses those same domain operations. The product is CLI-only; the hosting/React proposal has been removed.
 
+Worktree discovery reads `.knotignore` files from the repository root down through
+visited directories, using Git-compatible patterns with the nearest matching
+file taking precedence. Excluded directories are pruned. Tracked-file checks and
+checkout collision detection bypass ignores so rules cannot conceal modified
+tracked files or authorize overwriting local data. Git/user-global ignore sources
+are not imported; versioned `.knotignore` files keep shared rules reproducible.
+
 Four crates provide the domain, filesystem/transports, CLI, and MCP boundaries. Graph, resolution, verification, and ref-publication logic stay in `knot-core`; filesystem/SSH/mesh adapters stay in `knot-store`. Synchronous I/O avoids requiring an asynchronous runtime in local core operations; a future server may place it behind worker boundaries.
 
 ## Hidden contradictions resolved

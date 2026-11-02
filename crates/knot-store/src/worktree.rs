@@ -5,20 +5,8 @@ use std::{fs, path::Path};
 
 impl FsBackend {
     pub(crate) fn working_files(&self, include_ignored: bool) -> Result<Vec<String>> {
-        let ignore = if include_ignored {
-            None
-        } else {
-            let mut builder = GitignoreBuilder::new(&self.root);
-            let ignore_path = checked_join(&self.root, ".knotignore")?;
-            if ignore_path.exists()
-                && let Some(error) = builder.add(ignore_path)
-            {
-                return Err(Error::Invalid(format!("invalid .knotignore: {error}")));
-            }
-            Some(builder.build().map_err(|e| Error::Invalid(e.to_string()))?)
-        };
         let mut files = Vec::new();
-        self.walk_worktree(&self.root, ignore.as_ref(), &mut files)?;
+        self.walk_worktree(&self.root, include_ignored, &mut Vec::new(), &mut files)?;
         files.sort();
         validate_path_set(files.iter().map(String::as_str))?;
         Ok(files)
@@ -26,9 +14,24 @@ impl FsBackend {
     fn walk_worktree(
         &self,
         dir: &Path,
-        ignore: Option<&Gitignore>,
+        include_ignored: bool,
+        ignores: &mut Vec<Gitignore>,
         out: &mut Vec<String>,
     ) -> Result<()> {
+        let inherited = ignores.len();
+        if !include_ignored {
+            let ignore_path = checked_join(dir, ".knotignore")?;
+            if ignore_path.exists() {
+                let mut builder = GitignoreBuilder::new(dir);
+                if let Some(error) = builder.add(&ignore_path) {
+                    return Err(Error::Invalid(format!(
+                        "invalid {}: {error}",
+                        ignore_path.display()
+                    )));
+                }
+                ignores.push(builder.build().map_err(|e| Error::Invalid(e.to_string()))?);
+            }
+        }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry
@@ -42,10 +45,18 @@ impl FsBackend {
             }
             let file_type = entry.file_type()?;
             let path = entry.path();
-            if ignore.is_some_and(|i| {
-                i.matched_path_or_any_parents(&path, file_type.is_dir())
-                    .is_ignore()
-            }) {
+            // The closest directory's last matching rule wins. Pruning ignored
+            // directories also prevents negations from resurrecting children of
+            // an excluded parent, as with Git's ignore files.
+            if ignores
+                .iter()
+                .rev()
+                .find_map(|ignore| {
+                    let matched = ignore.matched(&path, file_type.is_dir());
+                    (!matched.is_none()).then(|| matched.is_ignore())
+                })
+                .unwrap_or(false)
+            {
                 continue;
             }
             let relative = path
@@ -66,11 +77,12 @@ impl FsBackend {
                 )));
             }
             if file_type.is_dir() {
-                self.walk_worktree(&path, ignore, out)?;
+                self.walk_worktree(&path, include_ignored, ignores, out)?;
             } else {
                 out.push(relative);
             }
         }
+        ignores.truncate(inherited);
         Ok(())
     }
     pub(crate) fn working_state(

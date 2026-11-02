@@ -48,6 +48,48 @@ fn human(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn knotignore_applies_to_cli_status_and_subdirectory_staging() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init"]);
+    fs::create_dir(root.join("cad")).unwrap();
+    for (path, contents) in [
+        (".knotignore", "*.bak\n"),
+        ("cad/.knotignore", "*.stl\n!reference.stl\n"),
+        ("cad/model.step", "Model"),
+        ("cad/output.stl", "Generated mesh"),
+        ("cad/reference.stl", "Reference mesh"),
+        ("cad/backup.bak", "Backup"),
+    ] {
+        fs::write(root.join(path), contents).unwrap();
+    }
+    let cad = root.join("cad");
+    assert_eq!(
+        ok(&cad, &["status"])["untracked"],
+        json!([
+            ".knotignore",
+            "cad/.knotignore",
+            "cad/model.step",
+            "cad/reference.stl"
+        ])
+    );
+    assert!(!run(&cad, &["add", "output.stl"]).status.success());
+    ok(&cad, &["add", "."]);
+    let staged = ok(root, &["status"]);
+    assert_eq!(staged["staged"].as_array().unwrap().len(), 3);
+    assert_eq!(staged["untracked"], json!([".knotignore"]));
+    ok(root, &["add", ".knotignore"]);
+    ok(root, &["commit", "-m", "Ignore generated meshes"]);
+    assert_eq!(ok(root, &["status"])["untracked"], json!([]));
+    fs::write(cad.join(".knotignore"), "").unwrap();
+    assert_eq!(
+        ok(&cad, &["status"])["untracked"],
+        json!(["cad/output.stl"])
+    );
+    ok(root, &["fsck"]);
+}
+
+#[test]
 fn release_checkout_preserves_a_same_spelled_branch() {
     let dir = tempdir().unwrap();
     let root = dir.path();

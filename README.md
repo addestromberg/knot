@@ -45,11 +45,43 @@ knot fsck
 
 Working directories contain one selected revision per tracked asset at its normal pathname, such as `mechanical/pipe.step`. Historical revisions stay in `.knot/objects/`; Knot does not create `pipe_R1.step`, `pipe_R2.step`, or parallel revision directories. Checkout replaces the selected tracked contents and applies recorded renames/deletions, while protecting local modifications and untracked files. Intentional copies are separate assets.
 
-`add <paths>` stages additions, modifications, and tracked deletions within those scopes. Paths are relative to the current directory or `-C <directory>`. Root `.knotignore` accepts Git-style patterns; `.git/` and `.knot/` are always excluded. Tracked files remain tracked when later ignored. There is no implicit use of `.gitignore`.
+`add <paths>` stages additions, modifications, and tracked deletions within those scopes. Paths are relative to the current directory or `-C <directory>`. `.knotignore` files control which untracked files appear in status or are staged; see below.
 
 Use `knot mv` to preserve asset identity. External moves are deletion plus addition, and copies get new identities. Case-only path transitions require a distinct intermediate name and snapshot for consistent behavior across platforms.
 
 `diff` compares working files with staging; `diff --staged` compares staging with `HEAD`. UTF-8 text receives unified diffs. Binary files, files containing NUL, and files larger than 1 MiB receive hash/size summaries.
+
+## Ignoring files
+
+Create a `.knotignore` in the project root or any subdirectory. Patterns use
+[Git's ignore syntax](https://git-scm.com/docs/gitignore), relative to the file's
+directory. For example:
+
+```gitignore
+# Generated outputs and local files
+build/
+*.bak
+**/cache/
+/local-config.toml
+*.stl
+!reference.stl
+```
+
+`#` starts a comment; blank lines are skipped. `*`, `?`, `[a-z]`, and `**` match
+patterns; a leading `/` anchors a rule to that `.knotignore` directory, a trailing
+`/` matches directories, and `!` re-includes a path. Escape a leading `#` or `!`
+with `\` to match it literally. The last matching rule wins within a file;
+rules in a nested `.knotignore` override matching parent rules for that subtree.
+To re-include a file inside an ignored directory, re-include its parent directories
+first: an excluded directory is not searched for exceptions or nested rules.
+
+Ignored untracked files are omitted from `knot status` and `knot add`, including
+explicit `add` paths. Already tracked files still report modifications/deletions
+and can be staged. Ignore rules never permit checkout to overwrite local files.
+Commit `.knotignore` files to share the rules through normal history and sync.
+Knot reads the working copies of these rules on every operation; `.gitignore`,
+Git's global excludes, and rules outside the repository do not apply. `.git/`,
+`.knot/`, and initialization metadata are always excluded.
 
 ## Dependencies and engineering interfaces (M2)
 

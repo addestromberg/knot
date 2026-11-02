@@ -1,1 +1,14 @@
+# Rust build outputs.
 /target/
+
+# Local configuration and credentials; keep documented examples versioned.
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system artifacts.
+*.rs.bk
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
