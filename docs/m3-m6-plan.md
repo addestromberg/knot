@@ -60,7 +60,7 @@ completed stage. The product is CLI-only; the previously proposed hosting/React 
 
 ## Verification record
 
-All 101 automated tests pass on Linux, including a two-repository 18 MiB transfer,
+All 103 Rust tests and two release-packaging tests pass on Linux, including a two-repository 18 MiB transfer,
 manual evidence/release restoration, override history, MCP write authorization,
 stale-preview rejection, SSH endpoint uploads/downloads, ref conflicts, and crash
 recovery. Rustfmt, Clippy with warnings denied, and the locked workspace build

@@ -24,6 +24,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+      - name: Test release packaging
+        shell: bash
+        env:
+          KNOT_PYTHON: ${{ runner.os == 'Windows' && 'python' || 'python3' }}
+        run: '"$KNOT_PYTHON" -m unittest discover -s scripts -p "test_*.py"'
+      - name: Build release executables
+        run: cargo build --workspace --release --locked
+      - name: Package release executables
+        shell: bash
+        env:
+          KNOT_PYTHON: ${{ runner.os == 'Windows' && 'python' || 'python3' }}
+        run: '"$KNOT_PYTHON" scripts/package-release.py --build "${{ github.run_number }}" --commit "$GITHUB_SHA"'
+      - name: Upload release downloads
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: knot-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
 
   latest-compatible:
     name: Latest compatible dependencies / Linux
@@ -35,3 +54,37 @@ jobs:
       - run: cargo update
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  release:
+    name: Publish beta release
+    needs: [locked, latest-compatible]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download tested platform builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: knot-*
+          path: dist
+          merge-multiple: true
+      - name: Publish beta prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          tag="v${version}-beta.${GITHUB_RUN_NUMBER}"
+          (cd dist && sha256sum -c *.sha256)
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            published=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)
+            test "$published" = "$GITHUB_SHA"
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "Knot ${tag}" --prerelease --latest=false --generate-notes \
+              --repo "$GITHUB_REPOSITORY"
+          fi

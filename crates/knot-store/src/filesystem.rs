@@ -26,18 +26,22 @@ pub struct FsBackend {
     _lock: File,
 }
 
+impl Drop for FsBackend {
+    fn drop(&mut self) {
+        // Release ownership now, even if a forked subprocess temporarily retains
+        // a duplicate descriptor before exec closes it on Unix.
+        let _ = self._lock.unlock();
+    }
+}
+
 impl FsBackend {
     pub fn init_bare(path: impl AsRef<Path>, author: Option<String>) -> Result<Self> {
-        let mut backend = Self::init(path, author)?;
-        backend.config.bare = true;
-        backend.config.format_version = 3;
-        backend.write_metadata(
-            "config.toml",
-            Some(&toml::to_string(&backend.config).map_err(|e| Error::Integrity(e.to_string()))?),
-        )?;
-        Ok(backend)
+        Self::initialize(path, author, true)
     }
     pub fn init(path: impl AsRef<Path>, author: Option<String>) -> Result<Self> {
+        Self::initialize(path, author, false)
+    }
+    fn initialize(path: impl AsRef<Path>, author: Option<String>, bare: bool) -> Result<Self> {
         fs::create_dir_all(path.as_ref())?;
         let root = fs::canonicalize(path)?;
         let destination = root.join(".knot");
@@ -64,14 +68,14 @@ impl FsBackend {
             .write(true)
             .open(meta.join("locks/repository"))?;
         lock.try_lock().map_err(lock_error)?;
-        let mut backend = Self {
+        let backend = Self {
             root,
             meta,
             config: Config {
-                format_version: 1,
+                format_version: if bare { 3 } else { 1 },
                 hash: "sha256".into(),
                 author,
-                bare: false,
+                bare,
             },
             _lock: lock,
         };
@@ -96,8 +100,14 @@ impl FsBackend {
             sync_directory(&backend.meta.join(sub))?;
         }
         sync_directory(&backend.meta)?;
+        // Windows cannot publish a directory while a child lock file is open.
+        // The staging directory is private; close its handles, atomically expose
+        // the complete repository, then acquire the published repository lock.
+        // Bare configuration must already be complete before that publication.
+        let root = backend.root.clone();
+        drop(backend);
         ensure_absent(&destination)?;
-        fs::rename(&backend.meta, &destination).map_err(|e| {
+        fs::rename(staging.path(), &destination).map_err(|e| {
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
@@ -107,9 +117,8 @@ impl FsBackend {
                 Error::Io(e)
             }
         })?;
-        backend.meta = destination;
-        sync_directory(&backend.root)?;
-        Ok(backend)
+        sync_directory(&root)?;
+        Self::open(root)
     }
 
     pub fn discover(start: impl AsRef<Path>) -> Result<Self> {
@@ -462,4 +471,26 @@ pub(crate) fn sync_directory_chain(path: &Path, stop: &Path) -> Result<()> {
         current = dir.parent();
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_backend_releases_lock_even_with_a_duplicated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FsBackend::init(dir.path(), None).unwrap();
+        let inherited = backend._lock.try_clone().unwrap();
+        drop(backend);
+        let reopened = FsBackend::open(dir.path()).unwrap();
+        drop(inherited);
+        assert_eq!(
+            FsBackend::open(dir.path()).err().unwrap().code(),
+            "repository_busy"
+        );
+        drop(reopened);
+        FsBackend::open(dir.path()).unwrap();
+    }
 }
