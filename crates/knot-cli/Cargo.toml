@@ -1,0 +1,22 @@
+[package]
+name = "knot-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "knot"
+path = "src/main.rs"
+
+[dependencies]
+knot-core.workspace = true
+knot-store.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
