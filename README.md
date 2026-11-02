@@ -21,6 +21,21 @@ parts fit, circuits work, or firmware is compatible.
 
 ## Install
 
+### Download a beta build
+
+Open [Releases](https://github.com/addestromberg/knot/releases) and download the
+archive matching your operating system and CPU architecture. Windows packages
+are ZIP files; Linux and macOS packages are `.tar.gz` files. Each contains `knot`,
+the optional `knot-mcp` server, license notices, and `BUILD-INFO.json` identifying the source commit.
+A `.sha256` file accompanies each archive.
+
+Extract the archive, then run `./knot --version` on Linux/macOS or
+`.\\knot.exe --version` in Windows PowerShell. Move the executables to a directory
+on your `PATH` to run them from anywhere. Prebuilt downloads do not require Rust.
+Choose the source installation below if a build does not support your system.
+
+### Install from source
+
 Install [Rust with rustup](https://rustup.rs/) and Git, then run:
 
 ```sh
@@ -206,3 +221,15 @@ recovery, follow `knot status` and use `knot recover --continue` or
 
 Run `knot --help` or `knot <command> --help` for command options. Report bugs and
 beta feedback in [GitHub Issues](https://github.com/addestromberg/knot/issues).
+
+## License
+
+Knot uses the [Knot Source-Available License](LICENSE). Personal use, internal
+business use, modification, and free redistribution are allowed under its terms.
+Selling Knot or a modified version as an application, or providing it as a paid
+hosted service, requires a separate written royalty agreement with Adde Stromberg.
+Your own designs, files, and products are not relicensed by using Knot.
+
+This is a custom source-available license, not an OSI open-source license.
+Third-party dependencies retain their own licenses. For commercial licensing,
+contact [Adde Stromberg](https://github.com/addestromberg).

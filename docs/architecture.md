@@ -31,6 +31,12 @@ The filesystem backend acquires an exclusive nonblocking OS file lock for every 
 
 Initialization builds metadata in a reserved `.knot-init-*` temporary directory before publishing the complete `.knot/` directory. A failed pre-publication initialization does not expose a partial repository; ordinary failures clean up staging automatically. A killed process may leave its private initialization directory, which worktree discovery excludes.
 
+Initialization closes the staging lock handle before renaming the directory,
+since open child handles block publication on Windows. The fully written regular
+or bare repository is then reopened and locked at its final path. A competing
+process may acquire that lock first; in that case initialization returns busy
+while leaving a complete repository, rather than exposing partial state.
+
 Objects are written and synced before publication. Existing object paths are verified and never replaced. Mutable pointers use temporary files in their destination directory and atomic replacement. Every multi-file mutation writes a versioned journal before changing files or refs. Expected values prevent stale updates; a checkout plan is recomputed before application.
 
 A transaction applies deletions before additions to support file/directory transitions, then metadata updates, then a completed audit log, and finally removes its journal. Recovery accepts only recorded before/after file states. Once a completion log exists, its outcome cannot be reversed by choosing abort. Validation happens before publishing snapshots so a rejected staging operation does not leave an invalid snapshot object.

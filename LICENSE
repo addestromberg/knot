@@ -1,0 +1,67 @@
+Knot Source-Available License 1.0
+
+Copyright (c) 2026 Adde Stromberg
+
+1. Scope and permission
+
+"Software" means Knot and the accompanying material made available under this
+license. "Modified Software" means modifications or derivative works of the
+Software. Subject to this license, you may use, copy, modify, and redistribute
+the Software and Modified Software in source or binary form, including for
+personal, educational, research, and internal business purposes, without paying
+a royalty.
+
+2. Paid applications and hosted services
+
+This license does not permit you to sell, license for a fee, rent, or otherwise
+provide the Software or Modified Software as a paid application, or to give third
+parties access to its functionality as a paid hosted or managed service. This
+restriction includes subscriptions, per-use charges, and access bundled into
+another paid product or service.
+
+Before making such an offering, you must obtain a separate written commercial
+agreement from Adde Stromberg that specifies the authorized offering and its
+royalty rate, calculation basis, reporting, and payment terms. You must pay the
+royalties required by that agreement. This license sets no default royalty rate,
+and a payment by itself does not grant commercial distribution or hosting rights.
+
+Internal business use is permitted, including using Knot to develop or manufacture
+products and to carry out paid engineering or consulting work, provided customers
+are not being sold or granted paid access to the Software or Modified Software.
+Files, designs, documentation, and other project data managed using Knot are not
+subject to this license merely because Knot stores or processes them.
+
+3. Notices and redistribution
+
+Include this license and retain applicable copyright and attribution notices in
+all copies and substantial portions of the Software and Modified Software.
+Identify your modifications when redistributing Modified Software. You may not
+remove the paid-offering restriction from the Software or Modified Software,
+relicense them to permit an offering prohibited by section 2, or grant rights
+you do not have. Recipients may exercise the permissions granted by this license
+subject to the same conditions. This license grants no trademark rights.
+
+Third-party components retain their own licenses. This license does not replace
+or restrict permissions granted by those third-party licenses.
+
+4. Termination
+
+Permissions under this license terminate automatically if you violate its
+conditions. Stop the unlicensed activity and distribution on termination.
+Reinstatement requires written permission from the copyright holder. Rights of
+recipients who remain compliant are not terminated by another person's breach.
+
+5. No warranty or liability
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS IS",
+WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. THE
+COPYRIGHT HOLDER AND CONTRIBUTORS ARE NOT LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE, WHETHER IN CONTRACT, TORT,
+OR OTHERWISE. MANDATORY RIGHTS THAT CANNOT LAWFULLY BE EXCLUDED ARE UNAFFECTED.
+
+6. Other rights
+
+No rights beyond those expressly granted are provided. Any separate commercial
+agreement applies only to the parties and uses it expressly covers. All other
+uses remain subject to this license.

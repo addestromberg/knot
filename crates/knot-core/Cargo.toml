@@ -3,6 +3,7 @@ name = "knot-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license-file.workspace = true
 
 [dependencies]
 serde.workspace = true

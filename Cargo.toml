@@ -6,6 +6,7 @@ resolver = "3"
 version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 knot-core = { path = "crates/knot-core" }

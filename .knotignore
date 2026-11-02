@@ -12,3 +12,7 @@
 *.swo
 .DS_Store
 Thumbs.db
+
+# Release packaging outputs.
+/dist/
+__pycache__/

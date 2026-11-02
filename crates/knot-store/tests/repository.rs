@@ -10,6 +10,39 @@ fn setup() -> (TempDir, Repository<FsBackend>) {
         Repository::open(FsBackend::init(dir.path(), Some("Engineer".into())).unwrap()).unwrap();
     (dir, repo)
 }
+
+#[test]
+fn initialization_publishes_complete_regular_and_bare_repositories_and_reacquires_the_lock() {
+    for bare in [false, true] {
+        let dir = tempdir().unwrap();
+        let backend = if bare {
+            FsBackend::init_bare(dir.path(), Some("Engineer".into())).unwrap()
+        } else {
+            FsBackend::init(dir.path(), Some("Engineer".into())).unwrap()
+        };
+        assert_eq!(backend.is_bare(), bare);
+        assert_eq!(backend.author().unwrap().as_deref(), Some("Engineer"));
+        assert_eq!(
+            FsBackend::open(dir.path()).err().unwrap().code(),
+            "repository_busy"
+        );
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".knot-init-")
+        }));
+        let repo = Repository::open(backend).unwrap();
+        assert_eq!(repo.status().unwrap().branch.as_deref(), Some("main"));
+        assert!(repo.status().unwrap().head.is_none());
+        repo.fsck().unwrap();
+        drop(repo);
+        let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+        assert_eq!(repo.backend().is_bare(), bare);
+        repo.fsck().unwrap();
+    }
+}
 fn commit(repo: &Repository<FsBackend>, message: &str) -> ObjectId {
     repo.add(&[".".into()]).unwrap();
     repo.commit(message).unwrap()
