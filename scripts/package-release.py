@@ -12,7 +12,48 @@ import tomllib
 import zipfile
 
 
-def package(binary_dir, output, target, source_version, build, commit):
+def dependency_notices(root, target):
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", target],
+        cwd=root, text=True, encoding="utf-8",
+    ))
+    packages = sorted((p for p in metadata["packages"] if p["source"]), key=lambda p: (p["name"], p["version"]))
+    entries = []
+    apache = None
+    for item in packages:
+        directory = Path(item["manifest_path"]).parent
+        files = {path for path in directory.iterdir() if path.is_file() and path.name.upper().startswith(
+            ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICENSE", "AUTHORS")
+        )}
+        if item["license_file"]:
+            files.add(directory / item["license_file"])
+        texts = [(path.name, path.read_text(encoding="utf-8")) for path in sorted(files)]
+        for name, text in texts:
+            if "APACHE" in name.upper() and "Apache License" in text:
+                apache = text
+        entries.append((item, texts))
+    sections = ["Third-party components retain their own licenses, independently of Knot's license.\n"]
+    shared = {}
+    for item, texts in entries:
+        # This pinned crate declares this license but omits its text from both
+        # its published package and upstream repository. Distribute it under
+        # that declared Apache-2.0 option, with the full standard license text.
+        if not texts and (item["name"], item["version"]) == ("unicode-casefold", "0.2.0") and apache:
+            texts = [("Apache-2.0 (declared upstream license option)", apache)]
+        if not texts:
+            raise ValueError(f"Missing license texts for {item['name']} {item['version']}")
+        sections.append(f"\n{item['name']} {item['version']}\nLicense declaration: {item['license']}\nAuthors: {', '.join(item['authors'])}\nRepository: {item['repository']}\n")
+        for name, text in texts:
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if digest not in shared:
+                shared[digest] = (len(shared) + 1, text)
+            sections.append(f"  {name}: license text {shared[digest][0]}\n")
+    for number, text in shared.values():
+        sections.append(f"\n{'=' * 72}\nLicense text {number}\n{'=' * 72}\n{text}\n")
+    return "".join(sections).encode()
+
+
+def package(binary_dir, output, target, source_version, build, commit, documents):
     version = f"{source_version}-beta.{build}"
     name = f"knot-{version}-{target}"
     windows = "windows" in target
@@ -32,6 +73,8 @@ def package(binary_dir, output, target, source_version, build, commit):
             for binary in binaries:
                 bundle.write(binary, binary.name)
             bundle.writestr("BUILD-INFO.json", identity)
+            for name, contents in documents.items():
+                bundle.writestr(name, contents)
     else:
         with tarfile.open(archive, "w:gz") as bundle:
             for binary in binaries:
@@ -43,6 +86,11 @@ def package(binary_dir, output, target, source_version, build, commit):
             info.size = len(identity)
             info.mode = 0o644
             bundle.addfile(info, io.BytesIO(identity))
+            for name, contents in documents.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(contents)
+                info.mode = 0o644
+                bundle.addfile(info, io.BytesIO(contents))
     with archive.open("rb") as contents:
         digest = hashlib.file_digest(contents, "sha256").hexdigest()
     archive.with_name(archive.name + ".sha256").write_text(
@@ -70,7 +118,11 @@ def main():
         parser.error("invalid Rust target triple")
     with (root / "Cargo.toml").open("rb") as manifest:
         version = tomllib.load(manifest)["workspace"]["package"]["version"]
-    print(package(args.binary_dir, args.output, target, version, args.build, args.commit))
+    documents = {
+        "LICENSE": (root / "LICENSE").read_bytes(),
+        "THIRD-PARTY-NOTICES.txt": dependency_notices(root, target),
+    }
+    print(package(args.binary_dir, args.output, target, version, args.build, args.commit, documents))
 
 
 if __name__ == "__main__":

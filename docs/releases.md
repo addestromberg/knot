@@ -7,7 +7,8 @@ publication. Development pushes and pull requests do not trigger CI automaticall
 
 The tag is `v<workspace-version>-beta.<workflow-run-number>`, for example
 `v0.6.0-beta.12`, and points at the exact tested commit. Each platform archive
-contains the release-mode `knot` and `knot-mcp` executables and `BUILD-INFO.json`.
+contains the release-mode `knot` and `knot-mcp` executables, `LICENSE`,
+`THIRD-PARTY-NOTICES.txt`, and `BUILD-INFO.json`.
 The archive name includes the native Rust target triple, so users can select the
 correct OS and CPU architecture. A separate `.sha256` file verifies each archive.
 Beta tags distinguish packaged builds; the binaries' `--version` reports the
