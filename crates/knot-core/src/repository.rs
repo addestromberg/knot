@@ -22,6 +22,7 @@ pub(crate) struct ReadCache {
     pub trees: BTreeMap<ObjectId, Tree>,
     pub graphs: BTreeMap<ObjectId, Arc<GraphReport>>,
     objects: BTreeMap<ObjectId, CheckedObject>,
+    blobs: BTreeMap<ObjectId, u64>,
     object_bytes: usize,
 }
 
@@ -267,6 +268,21 @@ impl<B: Backend> Repository<B> {
         }
         self.backend
             .put_versioned_object(T::KIND, value.schema_version(), &bytes)
+    }
+
+    pub(crate) fn checked_blob(&self, id: &ObjectId) -> Result<u64> {
+        if let Some(len) = self.read_cache().as_ref().and_then(|c| c.blobs.get(id)) {
+            return Ok(*len);
+        }
+        let len = self.backend.verify_blob(id)?;
+        if let Some(cache) = self.read_cache().as_mut() {
+            // Retain only IDs and checked lengths, never buffered blob contents.
+            if cache.blobs.len() >= 65_536 {
+                cache.blobs.clear();
+            }
+            cache.blobs.insert(id.clone(), len);
+        }
+        Ok(len)
     }
     fn head_value(&self) -> Result<String> {
         self.backend
@@ -542,7 +558,7 @@ impl<B: Backend> Repository<B> {
         for revision_id in tree.values() {
             let revision = self.load::<Revision>(revision_id)?;
             self.load::<Asset>(&revision.asset)?;
-            self.backend.verify_blob(&revision.blob)?;
+            self.checked_blob(&revision.blob)?;
             for parent in revision.parents {
                 if self.load::<Revision>(&parent)?.asset != revision.asset {
                     return Err(Error::Integrity(
@@ -770,7 +786,7 @@ impl<B: Backend> Repository<B> {
             let size = |state: &Option<FileState>| -> Result<Option<u64>> {
                 state
                     .as_ref()
-                    .map(|s| self.backend.verify_blob(&s.blob))
+                    .map(|s| self.checked_blob(&s.blob))
                     .transpose()
             };
             let before_size = size(&old)?;
@@ -1109,12 +1125,13 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn fsck(&self) -> Result<FsckReport> {
+        let _reads = self.read_scope();
         let objects = self.backend.list_objects()?;
         for id in &objects {
             let kind = self.backend.object_kind(id)?;
             match kind {
                 ObjectKind::Blob => {
-                    self.backend.verify_blob(id)?;
+                    self.checked_blob(id)?;
                 }
                 ObjectKind::Asset => {
                     self.load::<Asset>(id)?;
@@ -1123,7 +1140,7 @@ impl<B: Backend> Repository<B> {
                     let r = self.load::<Revision>(id)?;
                     self.verify_revision_metadata(&r)?;
                     self.load::<Asset>(&r.asset)?;
-                    self.backend.verify_blob(&r.blob)?;
+                    self.checked_blob(&r.blob)?;
                     for parent in r.parents {
                         if self.load::<Revision>(&parent)?.asset != r.asset {
                             return Err(Error::Integrity(

@@ -386,7 +386,7 @@ impl<B: Backend> Repository<B> {
             self.verify_dependency(&self.load::<Dependency>(id)?)?;
         }
         for id in &record.artifacts {
-            self.backend.verify_blob(id)?;
+            self.checked_blob(id)?;
         }
         if let Some(parent) = &record.parent
             && self.load::<ValidationRecord>(parent)?.subject != record.subject

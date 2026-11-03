@@ -15,6 +15,7 @@ struct CountingBackend {
     transactions: Cell<usize>,
     hashed: RefCell<BTreeMap<String, usize>>,
     structured_reads: RefCell<BTreeMap<ObjectId, usize>>,
+    blob_checks: RefCell<BTreeMap<ObjectId, usize>>,
 }
 impl Backend for CountingBackend {
     fn is_bare(&self) -> bool {
@@ -71,6 +72,7 @@ impl Backend for CountingBackend {
         self.inner.object_kind(id)
     }
     fn verify_blob(&self, id: &ObjectId) -> Result<u64> {
+        *self.blob_checks.borrow_mut().entry(id.clone()).or_default() += 1;
         self.inner.verify_blob(id)
     }
     fn list_objects(&self) -> Result<Vec<ObjectId>> {
@@ -132,6 +134,7 @@ fn bulk_overrides_hash_each_input_once_and_publish_one_transaction() {
         transactions: Cell::new(0),
         hashed: RefCell::default(),
         structured_reads: RefCell::default(),
+        blob_checks: RefCell::default(),
     })
     .unwrap();
     let records = repo
@@ -201,4 +204,64 @@ fn bulk_overrides_hash_each_input_once_and_publish_one_transaction() {
     assert!(matches!(repo.status(), Err(Error::Integrity(_))));
     fs::write(object, original).unwrap();
     assert_eq!(repo.status().unwrap().unstaged.len(), 1);
+}
+
+#[test]
+fn fsck_checks_shared_content_once_and_discards_trust_afterward() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    fs::write(dir.path().join("part"), vec![b'x'; 4096]).unwrap();
+    fs::write(dir.path().join("contract"), "initial").unwrap();
+    repo.add(&[".".into()]).unwrap();
+    repo.commit("Initial").unwrap();
+    for n in 0..10 {
+        fs::write(dir.path().join("contract"), format!("fit-{n}")).unwrap();
+        repo.set_interface("part", "fit", "contract").unwrap();
+        repo.commit(&format!("Update fit {n}")).unwrap();
+    }
+    let blob = repo
+        .graph(None)
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|n| n.path == "part")
+        .unwrap()
+        .blob;
+    drop(repo);
+    let repo = Repository::open(CountingBackend {
+        inner: FsBackend::open(dir.path()).unwrap(),
+        snapshots_read: Cell::new(0),
+        snapshots_written: Cell::new(0),
+        transactions: Cell::new(0),
+        hashed: RefCell::default(),
+        structured_reads: RefCell::default(),
+        blob_checks: RefCell::default(),
+    })
+    .unwrap();
+    repo.fsck().unwrap();
+    assert_eq!(repo.backend().blob_checks.borrow()[&blob], 1);
+    assert!(
+        repo.backend()
+            .blob_checks
+            .borrow()
+            .values()
+            .all(|n| *n == 1)
+    );
+    assert!(
+        repo.backend()
+            .structured_reads
+            .borrow()
+            .values()
+            .all(|n| *n == 1)
+    );
+    let path = dir.path().join(format!(
+        ".knot/objects/sha256/{}/{}",
+        &blob.as_str()[..2],
+        &blob.as_str()[2..]
+    ));
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, b"corrupted between calls").unwrap();
+    assert!(repo.fsck().is_err());
+    fs::write(path, original).unwrap();
+    repo.fsck().unwrap();
 }
