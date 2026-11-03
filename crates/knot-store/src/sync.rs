@@ -263,7 +263,7 @@ enum Connection {
     Ssh {
         child: Child,
         input: ProgressWriter,
-        output: BufReader<ProgressReader>,
+        output: Box<BufReader<ProgressReader>>,
     },
 }
 fn quote_shell(value: &str) -> String {
@@ -327,7 +327,7 @@ impl Connection {
                 let streams = (|| -> Result<_> {
                     Ok((
                         ProgressWriter::new(input, timeout)?,
-                        BufReader::new(ProgressReader::new(output, timeout)?),
+                        Box::new(BufReader::new(ProgressReader::new(output, timeout)?)),
                     ))
                 })();
                 match streams {
