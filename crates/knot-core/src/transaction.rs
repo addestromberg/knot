@@ -98,7 +98,7 @@ impl<B: Backend> Repository<B> {
                 return Err(Error::Integrity("duplicate transaction path".into()));
             }
             for state in [&change.before, &change.after].into_iter().flatten() {
-                self.backend.verify_blob(&state.blob)?;
+                self.checked_blob(&state.blob)?;
             }
         }
         let mut names = std::collections::BTreeSet::new();
