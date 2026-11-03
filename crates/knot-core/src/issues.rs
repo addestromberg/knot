@@ -171,6 +171,11 @@ impl<B: Backend> Repository<B> {
                 .read_meta(name)?
                 .ok_or_else(|| Error::Integrity(format!("missing {name}")))?,
         )?;
+        self.issue_at(identity, head)
+    }
+
+    // Replay a proposed head before it becomes visible through an issue ref.
+    pub(crate) fn issue_at(&self, identity: Uuid, head: ObjectId) -> Result<Issue> {
         let mut chain = Vec::new();
         let mut next = Some(head.clone());
         let mut seen = std::collections::BTreeSet::new();

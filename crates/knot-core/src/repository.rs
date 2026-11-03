@@ -1217,9 +1217,11 @@ impl<B: Backend> Repository<B> {
             validate_ref_name(name)?;
             self.load::<Commit>(id)?;
         } else if name.starts_with("refs/issues/") {
-            if name != format!("refs/issues/{}", self.load::<IssueEvent>(id)?.issue) {
+            let identity = self.load::<IssueEvent>(id)?.issue;
+            if name != format!("refs/issues/{identity}") {
                 return Err(Error::Integrity("issue ref identity mismatch".into()));
             }
+            self.issue_at(identity, id.clone())?;
         } else if name.starts_with("refs/reviews/") {
             let record = self.load::<ValidationRecord>(id)?;
             if review_ref(&record.subject)? != name {
