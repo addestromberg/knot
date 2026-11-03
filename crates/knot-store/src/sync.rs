@@ -627,10 +627,20 @@ pub fn push(
 ) -> Result<TransferReport> {
     ensure_ready(repo)?;
     repo.fsck()?;
-    let branch = branch
-        .map(str::to_owned)
-        .or(repo.status()?.branch)
-        .ok_or_else(|| Error::Invalid("push from detached HEAD requires a branch name".into()))?;
+    let branch = if let Some(branch) = branch {
+        branch.to_owned()
+    } else {
+        repo.backend()
+            .read_meta("HEAD")?
+            .and_then(|head| {
+                head.strip_prefix("ref: refs/heads/")
+                    .and_then(|name| name.strip_suffix('\n'))
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                Error::Invalid("push from detached HEAD requires a branch name".into())
+            })?
+    };
     validate_ref_name(&branch)?;
     let branch_ref = format!("refs/heads/{branch}");
     let refs: Vec<_> = repo
