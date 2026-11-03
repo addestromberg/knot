@@ -544,3 +544,41 @@ fn proposed_issue_histories_are_replayed_before_refs_are_published() {
         }
     }
 }
+
+#[test]
+fn push_uses_committed_state_without_inspecting_source_worktree() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("source");
+    let peer_path = dir.path().join("peer");
+    drop(FsBackend::init_bare(&peer_path, None).unwrap());
+    let source = Repository::open(FsBackend::init(&source_path, None).unwrap()).unwrap();
+    source.write_asset("part", b"committed").unwrap();
+    source.commit("Initial").unwrap();
+    remote_add(&source, "origin", peer_path.to_str().unwrap()).unwrap();
+    // A symlink is not portable worktree input, but it is outside the pushed state.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("part", source_path.join("untracked-link")).unwrap();
+    // A non-NFC untracked name proves the same property on every platform.
+    fs::write(source_path.join("untracked.e\u{301}"), "unrelated").unwrap();
+    fs::write(source_path.join("part"), "unstaged edits").unwrap();
+    push(&source, "origin", Some("main")).unwrap();
+    push(&source, "origin", None).unwrap();
+    // Checkout the same commit without consulting the intentionally invalid worktree.
+    let head = source.head_id().unwrap().unwrap();
+    source
+        .backend()
+        .write_meta("HEAD", Some(&format!("{head}\n")))
+        .unwrap();
+    assert!(matches!(
+        push(&source, "origin", None),
+        Err(Error::Invalid(_))
+    ));
+    push(&source, "origin", Some("main")).unwrap();
+    let peer = Repository::open(FsBackend::open(&peer_path).unwrap()).unwrap();
+    assert_eq!(peer.head_id().unwrap(), Some(head));
+    assert_eq!(
+        fs::read(source_path.join("part")).unwrap(),
+        b"unstaged edits"
+    );
+    peer.fsck().unwrap();
+}
