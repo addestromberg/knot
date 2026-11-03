@@ -38,6 +38,23 @@ forced command/path and filesystem permissions to limit accessible repositories.
 Read-only endpoints reject uploads. Remote configuration stays local and is not
 exchanged as engineering history.
 
+For a dedicated read-only key, combine the fixed command with OpenSSH's
+`restrict` option; a forced command alone does not disable forwarding:
+
+```text
+restrict,command="/usr/local/bin/knot -C /srv/knot/project serve --stdio --idle-timeout 60" ssh-ed25519 <public-key>
+```
+
+The CLI endpoint and SSH/Tailscale clients impose a 60-second deadline on stalled
+protocol reads and writes, including partial control messages, raw object frames,
+and blocked output. Timeout errors release the repository lock and roll back
+incomplete imports. Set `KNOT_SYNC_IDLE_TIMEOUT_SECONDS` (1–86400) to adjust the
+client and default endpoint timeout, or use `serve --idle-timeout <seconds>` for a
+fixed endpoint policy. The client passes its configured value to the normal SSH
+command; a forced command controls its own value. Allow more time for slow links
+or peer integrity checks. These application deadlines are separate from SSH's
+connection timeout and transport keepalives.
+
 ## Transfer and conflict rules
 
 Peers advertise object IDs and committed refs. Only missing objects are sent;

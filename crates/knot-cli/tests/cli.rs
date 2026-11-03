@@ -1079,3 +1079,200 @@ fn dependency_paths_and_definition_files_work_from_subdirectories() {
     ok(root, &["commit", "-m", "Declared interface"]);
     ok(root, &["fsck"]);
 }
+
+fn wait_for_endpoint_exit(child: &mut std::process::Child) {
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        if std::time::Instant::now() >= limit {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("endpoint failed to enforce its I/O deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stalled_endpoint_io_releases_locks_and_rolls_back_partial_uploads() {
+    use knot_core::{Backend, ObjectKind, Repository, object_header, object_id};
+    use knot_store::FsBackend;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    for mode in [
+        "idle",
+        "partial-control",
+        "partial-upload",
+        "blocked-output",
+    ] {
+        let dir = tempdir().unwrap();
+        let backend = FsBackend::init_bare(dir.path(), None).unwrap();
+        let retained = backend
+            .put_object(ObjectKind::Blob, &vec![7; 1024 * 1024])
+            .unwrap();
+        let existing = backend.list_objects().unwrap();
+        drop(backend);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_knot"));
+        command
+            .arg("-C")
+            .arg(dir.path())
+            .args(["serve", "--stdio", "--idle-timeout", "1"]);
+        if mode == "partial-upload" {
+            command.arg("--allow-writes");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let input = child.stdin.as_mut().unwrap();
+        match mode {
+            "idle" => {
+                input.write_all(b"{\"operation\":\"advertise\"}\n").unwrap();
+                input.flush().unwrap();
+                let mut reply = String::new();
+                output.read_line(&mut reply).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["ok"], true);
+            }
+            "partial-control" => {
+                input.write_all(b"{\"operation\":").unwrap();
+            }
+            "partial-upload" => {
+                let payload = b"new object rolled back after timeout";
+                let id = object_id(ObjectKind::Blob, payload);
+                let mut raw = object_header(ObjectKind::Blob, payload.len() as u64);
+                raw.extend_from_slice(payload);
+                let request = json!({"operation":"put","objects":[{"id":id,"len":raw.len()},{"id":retained,"len":100}],"updates":[]});
+                writeln!(input, "{request}").unwrap();
+                input.flush().unwrap();
+                let mut ready = String::new();
+                output.read_line(&mut ready).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&ready).unwrap()["data"]["ready"],
+                    true
+                );
+                input.write_all(&raw).unwrap();
+                input.write_all(b"knot\0").unwrap();
+            }
+            "blocked-output" => {
+                writeln!(input, "{}", json!({"operation":"get","objects":[retained]})).unwrap();
+                // Keep stdout open but deliberately do not drain its pipe.
+            }
+            _ => unreachable!(),
+        }
+        input.flush().unwrap();
+        wait_for_endpoint_exit(&mut child);
+        let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+        assert_eq!(repo.backend().list_objects().unwrap(), existing, "{mode}");
+        assert!(repo.backend().read_meta("incoming.json").unwrap().is_none());
+        repo.fsck().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stalled_ssh_peer_times_out_and_releases_the_local_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("project");
+    fs::create_dir(&root).unwrap();
+    ok(&root, &["init"]);
+    ok(
+        &root,
+        &["remote", "add", "origin", "ssh://review@unused/peer"],
+    );
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("-C")
+        .arg(&root)
+        .args(["--json", "fetch"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("KNOT_SYNC_IDLE_TIMEOUT_SECONDS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_endpoint_exit(&mut child);
+    let result = child.wait_with_output().unwrap();
+    let reply: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(reply["ok"], false);
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("progress timeout"),
+        "{reply}; stderr={}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    ok(&root, &["status"]);
+    ok(&root, &["fsck"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_pipe_transport_streams_frames_and_quotes_literal_repository_paths() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    ok(&source, &["init"]);
+    let content = vec![7; 128 * 1024 + 3];
+    fs::write(source.join("part"), &content).unwrap();
+    ok(&source, &["add", "."]);
+    ok(&source, &["commit", "-m", "Initial"]);
+    let peer = dir.path().join("peer'$(printf injected);");
+    ok(dir.path(), &["init", peer.to_str().unwrap(), "--bare"]);
+    let url = format!("ssh://review@unused{}", peer.display());
+    ok(&source, &["remote", "add", "origin", &url]);
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor argument do command=$argument; done\nexec /bin/sh -c \"$command\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![
+        bin,
+        Path::new(env!("CARGO_BIN_EXE_knot"))
+            .parent()
+            .unwrap()
+            .to_owned(),
+    ];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let network = |args: &[&str]| {
+        let result = Command::new(env!("CARGO_BIN_EXE_knot"))
+            .arg("-C")
+            .arg(&source)
+            .arg("--json")
+            .args(args)
+            .env("PATH", &path)
+            .env("KNOT_SYNC_IDLE_TIMEOUT_SECONDS", "5")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    network(&["push"]);
+    let copy = dir.path().join("copy");
+    network(&["clone", &url, copy.to_str().unwrap()]);
+    assert_eq!(fs::read(copy.join("part")).unwrap(), content);
+    ok(&copy, &["fsck"]);
+}

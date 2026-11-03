@@ -1,4 +1,5 @@
 //! Verified object/ref exchange over local paths or an authenticated OpenSSH subprocess.
+use crate::timed_io::{ProgressReader, ProgressWriter};
 use crate::{Error, FsBackend, Result};
 use knot_core::*;
 use serde::{Deserialize, Serialize};
@@ -7,10 +8,33 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 const MAX_CONTROL: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_SYNC_IDLE_TIMEOUT_SECONDS: u64 = 60;
+
+/// I/O progress deadline for SSH clients and the default stdio endpoint.
+pub fn sync_idle_timeout() -> Result<Duration> {
+    let seconds = match std::env::var("KNOT_SYNC_IDLE_TIMEOUT_SECONDS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| Error::Invalid("invalid KNOT_SYNC_IDLE_TIMEOUT_SECONDS".into()))?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_SYNC_IDLE_TIMEOUT_SECONDS,
+        Err(_) => {
+            return Err(Error::Invalid(
+                "invalid KNOT_SYNC_IDLE_TIMEOUT_SECONDS".into(),
+            ));
+        }
+    };
+    if !(1..=86_400).contains(&seconds) {
+        return Err(Error::Invalid(
+            "sync idle timeout must be between 1 and 86400 seconds".into(),
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,8 +262,8 @@ enum Connection {
     Local(Box<Repository<FsBackend>>),
     Ssh {
         child: Child,
-        input: ChildStdin,
-        output: BufReader<ChildStdout>,
+        input: ProgressWriter,
+        output: BufReader<ProgressReader>,
     },
 }
 fn quote_shell(value: &str) -> String {
@@ -252,6 +276,7 @@ impl Connection {
                 FsBackend::open(path)?,
             )?))),
             RemoteAddress::Ssh { host, path, .. } | RemoteAddress::Mesh { host, path } => {
+                let timeout = sync_idle_timeout()?;
                 let mesh = matches!(address, RemoteAddress::Mesh { .. });
                 let mut command = Command::new(if mesh { "tailscale" } else { "ssh" });
                 if mesh {
@@ -279,8 +304,9 @@ impl Connection {
                     command.arg("--");
                 }
                 let remote_command = format!(
-                    "knot -C {} serve --stdio{}",
+                    "knot -C {} serve --stdio --idle-timeout {}{}",
                     quote_shell(path),
+                    timeout.as_secs(),
                     if write { " --allow-writes" } else { "" }
                 );
                 let mut child = command
@@ -294,17 +320,28 @@ impl Connection {
                     .stdin
                     .take()
                     .ok_or_else(|| Error::Io(std::io::Error::other("missing SSH stdin")))?;
-                let output = BufReader::new(
-                    child
-                        .stdout
-                        .take()
-                        .ok_or_else(|| Error::Io(std::io::Error::other("missing SSH stdout")))?,
-                );
-                Ok(Self::Ssh {
-                    child,
-                    input,
-                    output,
-                })
+                let output = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| Error::Io(std::io::Error::other("missing SSH stdout")))?;
+                let streams = (|| -> Result<_> {
+                    Ok((
+                        ProgressWriter::new(input, timeout)?,
+                        BufReader::new(ProgressReader::new(output, timeout)?),
+                    ))
+                })();
+                match streams {
+                    Ok((input, output)) => Ok(Self::Ssh {
+                        child,
+                        input,
+                        output,
+                    }),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -502,7 +539,8 @@ fn success(out: &mut impl Write, value: impl Serialize) -> Result<()> {
     send(out, &serde_json::json!({"ok":true,"data":value}))
 }
 
-/// SSH forced-command endpoint. The OS account/SSH authorized_keys controls repository access.
+/// Endpoint for already bounded/nonblocking transports. For blocking pipes use
+/// `serve_repository_with_timeout`. SSH authorization is controlled by the OS.
 pub fn serve_repository(
     repo: &Repository<FsBackend>,
     input: &mut impl BufRead,
@@ -565,6 +603,23 @@ pub fn serve_repository(
         }
     }
     Ok(())
+}
+
+/// Bound blocking input/output stalls. Transport workers never own the backend,
+/// so an error can roll back imports and release the lock on the calling thread.
+pub fn serve_repository_with_timeout(
+    repo: &Repository<FsBackend>,
+    input: impl Read + Send + 'static,
+    output: impl Write + Send + 'static,
+    allow_writes: bool,
+    timeout: Duration,
+) -> Result<()> {
+    if timeout.is_zero() {
+        return Err(Error::Invalid("sync idle timeout must be positive".into()));
+    }
+    let mut input = BufReader::new(ProgressReader::new(input, timeout)?);
+    let mut output = ProgressWriter::new(output, timeout)?;
+    serve_repository(repo, &mut input, &mut output, allow_writes)
 }
 
 fn downloads(local: &Repository<FsBackend>, inventory: &Inventory) -> Result<Vec<ObjectId>> {
