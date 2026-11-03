@@ -75,7 +75,22 @@ knot commit -m "Update housing"
 knot log
 ```
 
-`knot status` shows file changes, the dependency graph, and verification warnings.
+`knot status` summarizes tracked/unchanged files, staged/unstaged/untracked counts,
+dependency matches/conflicts, and verified/unverified/stale/failed/error checks.
+Only dependency conflicts and failed/error checks are listed individually by
+default. Recovery and unstaged-file warnings remain visible. Review counts refer
+to dependency, test, and asset checks, not a verification claim about every file.
+Use `knot status --verbose` (or `-v`) for every changed path, the complete graph,
+and individual verification/upstream-review entries. `--json` always returns the
+complete report regardless of verbosity.
+
+`knot validate` uses the same check summary; add `-v` to list all selected checks.
+Checkout uses the concise status display too. `knot log` shows one line per
+commit, with author/time/full messages available through `-v`. `knot issue list`
+shows issue IDs, states, and titles; `-v` includes complete records. Explicit
+inspection commands such as `knot graph`, `knot diff`, and `knot issue show` keep
+their detailed output.
+
 Use `knot mv old-name.step new-name.step` to rename a tracked asset while retaining
 its identity and dependencies.
 
