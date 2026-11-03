@@ -77,6 +77,7 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn recover(&self, abort: bool) -> Result<()> {
+        let _reads = self.read_scope();
         let text = self
             .backend
             .read_meta("transaction.json")?

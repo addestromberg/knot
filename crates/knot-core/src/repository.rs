@@ -2,6 +2,7 @@ use crate::*;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -10,6 +11,36 @@ pub(crate) type Tree = BTreeMap<String, ObjectId>;
 
 pub struct Repository<B: Backend> {
     pub(crate) backend: B,
+    reads: Mutex<Option<ReadCache>>,
+}
+
+// Reuse fully checked immutable snapshots only within a single operation. Never
+// retain trust across calls: callers may edit working files or corrupt objects.
+#[derive(Default)]
+pub(crate) struct ReadCache {
+    pub trees: BTreeMap<ObjectId, Tree>,
+    pub graphs: BTreeMap<ObjectId, Arc<GraphReport>>,
+    objects: BTreeMap<ObjectId, CheckedObject>,
+    object_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CheckedObject {
+    kind: ObjectKind,
+    version: u32,
+    bytes: Arc<[u8]>,
+}
+
+pub(crate) struct ReadScope<'a> {
+    reads: &'a Mutex<Option<ReadCache>>,
+    owner: bool,
+}
+impl Drop for ReadScope<'_> {
+    fn drop(&mut self) {
+        if self.owner {
+            *self.reads.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -119,7 +150,10 @@ fn changes(before: &Tree, after: &Tree) -> Vec<Change> {
 
 impl<B: Backend> Repository<B> {
     pub fn open(backend: B) -> Result<Self> {
-        let repo = Self { backend };
+        let repo = Self {
+            backend,
+            reads: Mutex::new(None),
+        };
         repo.head_value()?;
         repo.index_id()?;
         Ok(repo)
@@ -128,15 +162,51 @@ impl<B: Backend> Repository<B> {
         &self.backend
     }
 
+    pub(crate) fn read_cache(&self) -> MutexGuard<'_, Option<ReadCache>> {
+        // Only successfully checked immutable data is cached.
+        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn read_scope(&self) -> ReadScope<'_> {
+        let mut reads = self.read_cache();
+        let owner = reads.is_none();
+        if owner {
+            *reads = Some(ReadCache::default());
+        }
+        ReadScope {
+            reads: &self.reads,
+            owner,
+        }
+    }
+
     pub fn load<T: StoredObject>(&self, id: &ObjectId) -> Result<T> {
-        let version = self.backend.object_version(id)?;
+        let cached = self
+            .read_cache()
+            .as_ref()
+            .and_then(|c| c.objects.get(id))
+            .cloned();
+        let object = if let Some(object) = cached {
+            object
+        } else {
+            let version = self.backend.object_version(id)?;
+            let (kind, bytes) = self.backend.get_object(id)?;
+            CheckedObject {
+                kind,
+                version,
+                bytes: bytes.into(),
+            }
+        };
+        let CheckedObject {
+            kind,
+            version,
+            ref bytes,
+        } = object;
         if !T::SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::Integrity(format!(
                 "unsupported {} schema version: {version}",
                 T::KIND.as_str()
             )));
         }
-        let (kind, bytes) = self.backend.get_object(id)?;
         if kind != T::KIND {
             return Err(Error::Integrity(format!(
                 "{id}: expected {}, got {}",
@@ -144,11 +214,22 @@ impl<B: Backend> Repository<B> {
                 kind.as_str()
             )));
         }
-        let value: T = serde_json::from_slice(&bytes)?;
-        if value.schema_version() != version || canonical(&value)? != bytes {
+        let value: T = serde_json::from_slice(bytes)?;
+        if value.schema_version() != version || canonical(&value)?.as_slice() != bytes.as_ref() {
             return Err(Error::Integrity(format!("{id}: noncanonical object")));
         }
         value.validate()?;
+        if let Some(cache) = self.read_cache().as_mut()
+            && !cache.objects.contains_key(id)
+            && bytes.len() <= 32 * 1024 * 1024
+        {
+            if cache.object_bytes + bytes.len() > 32 * 1024 * 1024 {
+                cache.objects.clear();
+                cache.object_bytes = 0;
+            }
+            cache.object_bytes += bytes.len();
+            cache.objects.insert(id.clone(), object);
+        }
         Ok(value)
     }
     pub(crate) fn put<T: StoredObject>(&self, value: &T) -> Result<ObjectId> {
@@ -208,13 +289,24 @@ impl<B: Backend> Repository<B> {
         self.tree(&self.index_id()?)
     }
     pub(crate) fn tree(&self, id: &ObjectId) -> Result<Tree> {
+        if let Some(tree) = self.read_cache().as_ref().and_then(|c| c.trees.get(id)) {
+            return Ok(tree.clone());
+        }
         let snapshot = self.load::<Snapshot>(id)?;
         self.validate_snapshot(&snapshot)?;
-        Ok(snapshot
+        let tree: Tree = snapshot
             .entries
             .into_iter()
             .map(|e| (e.path, e.revision))
-            .collect())
+            .collect();
+        if let Some(cache) = self.read_cache().as_mut() {
+            // Bound memory even when checking a repository's entire history.
+            if cache.trees.len() >= 8 {
+                cache.trees.clear();
+            }
+            cache.trees.insert(id.clone(), tree.clone());
+        }
+        Ok(tree)
     }
     fn validate_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         snapshot.validate()?;
@@ -272,6 +364,7 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn status(&self) -> Result<Status> {
+        let _reads = self.read_scope();
         let head = self.head_id()?;
         let index = self.index_tree()?;
         let mut unstaged = Vec::new();

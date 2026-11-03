@@ -314,3 +314,88 @@ fn dependency_staging_recovers_or_aborts_without_changing_committed_history() {
         recovered.fsck().unwrap();
     }
 }
+
+#[test]
+fn bulk_overrides_recover_or_abort_at_every_metadata_write() {
+    for abort in [false, true] {
+        for boundary in 1..=6 {
+            let dir = tempdir().unwrap();
+            let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+            for name in ["pipe", "rod", "assembly"] {
+                fs::write(dir.path().join(name), name).unwrap();
+            }
+            repo.add(&[".".into()]).unwrap();
+            repo.add_dependency("rod", "pipe", DependencyRequest::Revision(None))
+                .unwrap();
+            repo.add_dependency("assembly", "rod", DependencyRequest::Revision(None))
+                .unwrap();
+            let head = repo.commit("Initial").unwrap();
+            fs::write(dir.path().join("pipe"), "changed").unwrap();
+            let before = repo.add(&["pipe".into()]).unwrap();
+            let subjects: Vec<_> = repo
+                .verification(None)
+                .unwrap()
+                .dependencies
+                .into_iter()
+                .map(|e| e.subject)
+                .collect();
+            drop(repo);
+            let repo = Repository::open(FaultBackend {
+                inner: FsBackend::open(dir.path()).unwrap(),
+                remaining: Cell::new(Some(boundary)),
+            })
+            .unwrap();
+            assert!(
+                repo.override_dependency_reviews(&subjects, "Operator", "Accept without testing")
+                    .is_err()
+            );
+            drop(repo);
+            let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+            let pending = repo
+                .backend()
+                .read_meta("transaction.json")
+                .unwrap()
+                .is_some();
+            if pending {
+                if abort && boundary == 5 {
+                    // The completion log is already durable; recovery must honor it.
+                    assert!(matches!(repo.recover(true), Err(Error::Conflict(_))));
+                    repo.recover(false).unwrap();
+                } else {
+                    repo.recover(abort).unwrap();
+                }
+            }
+            assert_eq!(repo.head_id().unwrap(), Some(head));
+            let status = repo.status().unwrap();
+            assert!(!status.recovery_required);
+            if abort && pending && boundary < 5 {
+                assert_eq!(status.staged_snapshot, before);
+                assert!(
+                    status
+                        .verification
+                        .dependencies
+                        .iter()
+                        .all(|e| e.record.is_none())
+                );
+                assert!(
+                    repo.backend()
+                        .list_meta("refs/reviews/")
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert_ne!(status.staged_snapshot, before);
+                assert!(status.requirements_satisfied);
+                assert_eq!(status.verification.dependencies.len(), 2);
+                assert!(
+                    status
+                        .verification
+                        .dependencies
+                        .iter()
+                        .all(|e| e.overridden && e.state == VerificationState::Verified)
+                );
+            }
+            repo.fsck().unwrap();
+        }
+    }
+}

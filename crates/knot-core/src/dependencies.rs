@@ -1,7 +1,10 @@
 //! Versioned declarations and snapshot-based graph queries. No resolver or test runner.
 use crate::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 pub fn validate_interface_name(name: &str) -> Result<()> {
     if name.is_empty()
@@ -288,15 +291,10 @@ impl<B: Backend> Repository<B> {
         &self,
         mut tree: Tree,
         path: String,
-        mut revision: Revision,
+        revision: Revision,
         object: Option<ObjectId>,
         purpose: &str,
     ) -> Result<MetadataUpdate> {
-        revision.dependencies.sort();
-        revision.dependencies.dedup();
-        revision.interfaces.sort();
-        revision.interfaces.dedup();
-        self.verify_revision_metadata(&revision)?;
         let mut baseline = None;
         for id in self.head_tree()?.values() {
             let candidate = self.load::<Revision>(id)?;
@@ -306,17 +304,7 @@ impl<B: Backend> Repository<B> {
             }
         }
         let asset = revision.asset.clone();
-        let id = if let Some((id, candidate)) = baseline {
-            if same_revision_state(&revision, &candidate) {
-                id
-            } else {
-                revision.parents = vec![id];
-                self.put(&revision)?
-            }
-        } else {
-            revision.parents.clear();
-            self.put(&revision)?
-        };
+        let id = self.save_revision(revision, baseline)?;
         tree.insert(path, id.clone());
         let snapshot = self.stage_tree(&tree, purpose)?;
         Ok(MetadataUpdate {
@@ -325,6 +313,29 @@ impl<B: Backend> Repository<B> {
             revision: id,
             object,
         })
+    }
+
+    pub(crate) fn save_revision(
+        &self,
+        mut revision: Revision,
+        baseline: Option<(ObjectId, Revision)>,
+    ) -> Result<ObjectId> {
+        revision.dependencies.sort();
+        revision.dependencies.dedup();
+        revision.interfaces.sort();
+        revision.interfaces.dedup();
+        self.verify_revision_metadata(&revision)?;
+        if let Some((id, candidate)) = baseline {
+            if same_revision_state(&revision, &candidate) {
+                Ok(id)
+            } else {
+                revision.parents = vec![id];
+                self.put(&revision)
+            }
+        } else {
+            revision.parents.clear();
+            self.put(&revision)
+        }
     }
 
     pub fn set_interface(
@@ -476,6 +487,16 @@ impl<B: Backend> Repository<B> {
         self.graph_snapshot(&snapshot)
     }
     pub(crate) fn graph_snapshot(&self, snapshot: &ObjectId) -> Result<GraphReport> {
+        Ok((*self.checked_graph(snapshot)?).clone())
+    }
+    pub(crate) fn checked_graph(&self, snapshot: &ObjectId) -> Result<Arc<GraphReport>> {
+        if let Some(graph) = self
+            .read_cache()
+            .as_ref()
+            .and_then(|c| c.graphs.get(snapshot))
+        {
+            return Ok(graph.clone());
+        }
         let tree = self.tree(snapshot)?;
         let mut nodes = Vec::new();
         for (path, id) in tree {
@@ -563,13 +584,20 @@ impl<B: Backend> Repository<B> {
         let requirements_satisfied = edges
             .iter()
             .all(|e| e.status == RequirementStatus::Satisfied);
-        Ok(GraphReport {
+        let graph = Arc::new(GraphReport {
             snapshot: snapshot.clone(),
             nodes,
             edges,
             requirements_satisfied,
             declarations_only: true,
-        })
+        });
+        if let Some(cache) = self.read_cache().as_mut() {
+            if cache.graphs.len() >= 8 {
+                cache.graphs.clear();
+            }
+            cache.graphs.insert(snapshot.clone(), graph.clone());
+        }
+        Ok(graph)
     }
     pub(crate) fn require_satisfied(&self, snapshot: &ObjectId) -> Result<()> {
         let conflicts: Vec<_> = self
