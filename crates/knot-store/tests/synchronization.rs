@@ -459,3 +459,88 @@ fn compare_and_swap_and_immutable_references_are_enforced() {
     );
     assert_eq!(repo.resolve("v1").unwrap(), first);
 }
+
+#[test]
+fn proposed_issue_histories_are_replayed_before_refs_are_published() {
+    for new_issue in [false, true] {
+        for close in [false, true] {
+            let dir = tempdir().unwrap();
+            let source =
+                Repository::open(FsBackend::init(dir.path().join("source"), None).unwrap())
+                    .unwrap();
+            let peer =
+                Repository::open(FsBackend::init_bare(dir.path().join("peer"), None).unwrap())
+                    .unwrap();
+            let mut issue = source
+                .create_issue("Review fit", "Measure clearance")
+                .unwrap();
+            if close {
+                issue = source
+                    .update_issue(&issue.id.to_string(), IssueAction::Close, None)
+                    .unwrap();
+            }
+            let name = format!("refs/issues/{}", issue.id);
+            let mut bytes = Vec::new();
+            for id in source.backend().list_objects().unwrap() {
+                bytes.clear();
+                source.backend().export_object(&id, &mut bytes).unwrap();
+                peer.backend()
+                    .import_object(&id, bytes.len() as u64, &mut Cursor::new(&bytes))
+                    .unwrap();
+            }
+            if !new_issue {
+                peer.publish_references(
+                    &[ReferenceUpdate {
+                        name: name.clone(),
+                        before: None,
+                        after: issue.head.clone(),
+                    }],
+                    None,
+                    false,
+                )
+                .unwrap();
+            }
+            let refs = peer.reference_inventory().unwrap();
+            let mut event = source.load::<IssueEvent>(&issue.head).unwrap();
+            event.parent = Some(issue.head.clone());
+            event.action = if close {
+                IssueAction::Close
+            } else {
+                IssueAction::Reopen
+            };
+            let payload = canonical(&event).unwrap();
+            let id = object_id(ObjectKind::IssueEvent, &payload);
+            let update = ReferenceUpdate {
+                name,
+                before: (!new_issue).then_some(issue.head),
+                after: id.clone(),
+            };
+            let mut raw = object_header(ObjectKind::IssueEvent, payload.len() as u64);
+            raw.extend_from_slice(&payload);
+            let mut input = serde_json::to_vec(&serde_json::json!({"operation":"put", "objects":[{"id":id,"len":raw.len()}],"updates":[update]})).unwrap();
+            input.push(b'\n');
+            input.extend_from_slice(&raw);
+            let mut output = Vec::new();
+            serve_repository(&peer, &mut Cursor::new(input), &mut output, true).unwrap();
+            let replies: Vec<serde_json::Value> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(replies[0]["data"]["ready"], true);
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(replies[1]["error"]["code"], "integrity_failure");
+            assert_eq!(peer.reference_inventory().unwrap(), refs);
+            assert!(
+                !peer
+                    .backend()
+                    .read_meta("transaction.json")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(peer.publish_references(&[update], None, false).is_err());
+            assert_eq!(peer.reference_inventory().unwrap(), refs);
+            peer.fsck().unwrap();
+        }
+    }
+}
