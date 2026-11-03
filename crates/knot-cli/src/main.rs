@@ -79,6 +79,9 @@ enum Command {
         stdio: bool,
         #[arg(long)]
         allow_writes: bool,
+        /// Abort a stalled protocol read or write after this many seconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        idle_timeout: Option<u64>,
     },
     /// Stage files, modifications, and tracked deletions in the supplied scopes.
     Add {
@@ -1056,14 +1059,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Command::Serve { allow_writes, .. } = &cli.command {
+    if let Command::Serve {
+        allow_writes,
+        idle_timeout,
+        ..
+    } = &cli.command
+    {
         let result = (|| -> Result<()> {
             let repo = Repository::open(FsBackend::discover(&cli.directory)?)?;
-            knot_store::serve_repository(
+            let timeout = match idle_timeout {
+                Some(seconds) => std::time::Duration::from_secs(*seconds),
+                None => knot_store::sync_idle_timeout()?,
+            };
+            knot_store::serve_repository_with_timeout(
                 &repo,
-                &mut std::io::stdin().lock(),
-                &mut std::io::stdout().lock(),
+                std::io::stdin(),
+                std::io::stdout(),
                 *allow_writes,
+                timeout,
             )
         })();
         return match result {

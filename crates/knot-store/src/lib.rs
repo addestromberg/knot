@@ -3,6 +3,7 @@ mod filesystem;
 mod objects;
 mod peers;
 mod sync;
+mod timed_io;
 mod worktree;
 
 pub use filesystem::FsBackend;
