@@ -190,7 +190,7 @@ impl<B: Backend> Repository<B> {
     pub(crate) fn verify_interface(&self, interface: &Interface) -> Result<()> {
         interface.validate()?;
         self.load::<Asset>(&interface.asset)?;
-        self.backend.verify_blob(&interface.definition)?;
+        self.checked_blob(&interface.definition)?;
         Ok(())
     }
     pub(crate) fn verify_dependency(&self, dependency: &Dependency) -> Result<()> {

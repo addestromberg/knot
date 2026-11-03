@@ -1,8 +1,9 @@
 use crate::*;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     sync::{Arc, Mutex, MutexGuard},
+    thread::{self, ThreadId},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -11,7 +12,7 @@ pub(crate) type Tree = BTreeMap<String, ObjectId>;
 
 pub struct Repository<B: Backend> {
     pub(crate) backend: B,
-    reads: Mutex<Option<ReadCache>>,
+    reads: Mutex<HashMap<ThreadId, ReadCache>>,
 }
 
 // Reuse fully checked immutable snapshots only within a single operation. Never
@@ -21,6 +22,7 @@ pub(crate) struct ReadCache {
     pub trees: BTreeMap<ObjectId, Tree>,
     pub graphs: BTreeMap<ObjectId, Arc<GraphReport>>,
     objects: BTreeMap<ObjectId, CheckedObject>,
+    blobs: BTreeMap<ObjectId, u64>,
     object_bytes: usize,
 }
 
@@ -32,14 +34,31 @@ struct CheckedObject {
 }
 
 pub(crate) struct ReadScope<'a> {
-    reads: &'a Mutex<Option<ReadCache>>,
+    reads: &'a Mutex<HashMap<ThreadId, ReadCache>>,
+    thread: ThreadId,
     owner: bool,
 }
 impl Drop for ReadScope<'_> {
     fn drop(&mut self) {
         if self.owner {
-            *self.reads.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.thread);
         }
+    }
+}
+
+pub(crate) struct ReadCacheAccess<'a> {
+    caches: MutexGuard<'a, HashMap<ThreadId, ReadCache>>,
+    thread: ThreadId,
+}
+impl ReadCacheAccess<'_> {
+    pub fn as_ref(&self) -> Option<&ReadCache> {
+        self.caches.get(&self.thread)
+    }
+    pub fn as_mut(&mut self) -> Option<&mut ReadCache> {
+        self.caches.get_mut(&self.thread)
     }
 }
 
@@ -152,7 +171,7 @@ impl<B: Backend> Repository<B> {
     pub fn open(backend: B) -> Result<Self> {
         let repo = Self {
             backend,
-            reads: Mutex::new(None),
+            reads: Mutex::new(HashMap::new()),
         };
         repo.head_value()?;
         repo.index_id()?;
@@ -162,19 +181,26 @@ impl<B: Backend> Repository<B> {
         &self.backend
     }
 
-    pub(crate) fn read_cache(&self) -> MutexGuard<'_, Option<ReadCache>> {
+    pub(crate) fn read_cache(&self) -> ReadCacheAccess<'_> {
         // Only successfully checked immutable data is cached.
-        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+        ReadCacheAccess {
+            caches: self.reads.lock().unwrap_or_else(|e| e.into_inner()),
+            thread: thread::current().id(),
+        }
     }
 
     pub(crate) fn read_scope(&self) -> ReadScope<'_> {
         let mut reads = self.read_cache();
-        let owner = reads.is_none();
-        if owner {
-            *reads = Some(ReadCache::default());
-        }
+        // Nested synchronous helpers share trust; calls on other threads do not.
+        let owner = if let Entry::Vacant(entry) = reads.caches.entry(reads.thread) {
+            entry.insert(ReadCache::default());
+            true
+        } else {
+            false
+        };
         ReadScope {
             reads: &self.reads,
+            thread: reads.thread,
             owner,
         }
     }
@@ -242,6 +268,21 @@ impl<B: Backend> Repository<B> {
         }
         self.backend
             .put_versioned_object(T::KIND, value.schema_version(), &bytes)
+    }
+
+    pub(crate) fn checked_blob(&self, id: &ObjectId) -> Result<u64> {
+        if let Some(len) = self.read_cache().as_ref().and_then(|c| c.blobs.get(id)) {
+            return Ok(*len);
+        }
+        let len = self.backend.verify_blob(id)?;
+        if let Some(cache) = self.read_cache().as_mut() {
+            // Retain only IDs and checked lengths, never buffered blob contents.
+            if cache.blobs.len() >= 65_536 {
+                cache.blobs.clear();
+            }
+            cache.blobs.insert(id.clone(), len);
+        }
+        Ok(len)
     }
     fn head_value(&self) -> Result<String> {
         self.backend
@@ -517,7 +558,7 @@ impl<B: Backend> Repository<B> {
         for revision_id in tree.values() {
             let revision = self.load::<Revision>(revision_id)?;
             self.load::<Asset>(&revision.asset)?;
-            self.backend.verify_blob(&revision.blob)?;
+            self.checked_blob(&revision.blob)?;
             for parent in revision.parents {
                 if self.load::<Revision>(&parent)?.asset != revision.asset {
                     return Err(Error::Integrity(
@@ -745,7 +786,7 @@ impl<B: Backend> Repository<B> {
             let size = |state: &Option<FileState>| -> Result<Option<u64>> {
                 state
                     .as_ref()
-                    .map(|s| self.backend.verify_blob(&s.blob))
+                    .map(|s| self.checked_blob(&s.blob))
                     .transpose()
             };
             let before_size = size(&old)?;
@@ -1084,12 +1125,13 @@ impl<B: Backend> Repository<B> {
     }
 
     pub fn fsck(&self) -> Result<FsckReport> {
+        let _reads = self.read_scope();
         let objects = self.backend.list_objects()?;
         for id in &objects {
             let kind = self.backend.object_kind(id)?;
             match kind {
                 ObjectKind::Blob => {
-                    self.backend.verify_blob(id)?;
+                    self.checked_blob(id)?;
                 }
                 ObjectKind::Asset => {
                     self.load::<Asset>(id)?;
@@ -1098,7 +1140,7 @@ impl<B: Backend> Repository<B> {
                     let r = self.load::<Revision>(id)?;
                     self.verify_revision_metadata(&r)?;
                     self.load::<Asset>(&r.asset)?;
-                    self.backend.verify_blob(&r.blob)?;
+                    self.checked_blob(&r.blob)?;
                     for parent in r.parents {
                         if self.load::<Revision>(&parent)?.asset != r.asset {
                             return Err(Error::Integrity(
@@ -1217,9 +1259,11 @@ impl<B: Backend> Repository<B> {
             validate_ref_name(name)?;
             self.load::<Commit>(id)?;
         } else if name.starts_with("refs/issues/") {
-            if name != format!("refs/issues/{}", self.load::<IssueEvent>(id)?.issue) {
+            let identity = self.load::<IssueEvent>(id)?.issue;
+            if name != format!("refs/issues/{identity}") {
                 return Err(Error::Integrity("issue ref identity mismatch".into()));
             }
+            self.issue_at(identity, id.clone())?;
         } else if name.starts_with("refs/reviews/") {
             let record = self.load::<ValidationRecord>(id)?;
             if review_ref(&record.subject)? != name {

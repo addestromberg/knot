@@ -496,7 +496,7 @@ fn writable_peer_endpoint_streams_objects_and_publishes_refs_after_verification(
 }
 
 #[test]
-fn status_displays_staged_graph_and_warns_about_unstaged_edits() {
+fn status_summarizes_by_default_and_verbose_displays_the_staged_graph() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     ok(root, &["init"]);
@@ -512,27 +512,37 @@ fn status_displays_staged_graph_and_warns_about_unstaged_edits() {
     let before = ok(root, &["status"]);
     let clean = human(root, &["status"]);
     assert!(clean.contains("Working tree clean"));
-    assert!(clean.contains("Dependency graph (staged; parent depends on child)"));
-    assert!(clean.contains("#2 rod.step @"));
-    assert!(clean.contains("└── #1 pipe.step @"));
-    assert!(clean.contains("[matches]"));
-    assert!(clean.contains("2 tracked files · 1 dependency · 0 conflicts"));
+    assert!(clean.contains("Files: 2 tracked · 2 unchanged · 0 staged · 0 unstaged · 0 untracked"));
+    assert!(clean.contains("Dependencies: 1 satisfied · 0 conflicts"));
+    assert!(clean.contains("Verification: 0 verified · 1 unverified"));
+    assert!(!clean.contains("pipe.step"));
+    let verbose = human(root, &["status", "--verbose"]);
+    assert!(verbose.contains("Dependency graph (staged; parent depends on child)"));
+    assert!(verbose.contains("#2 rod.step @"));
+    assert!(verbose.contains("└── #1 pipe.step @"));
+    assert!(verbose.contains("[matches]"));
+    assert!(verbose.contains("2 tracked files · 1 dependency · 0 conflicts"));
     assert!(!clean.contains('\u{1b}'));
     assert_eq!(ok(root, &["status"]), before);
 
     fs::write(root.join("pipe.step"), "pipe with mount").unwrap();
     fs::write(root.join("notes.txt"), "review mounting clearance").unwrap();
     let unstaged = human(root, &["status"]);
-    assert!(unstaged.contains("Unstaged changes:"));
-    assert!(unstaged.contains("Untracked files:\n  ?  notes.txt"));
-    assert!(unstaged.contains("[unstaged modified]"));
+    assert!(unstaged.contains("1 unstaged · 1 untracked"));
+    assert!(!unstaged.contains("notes.txt"));
+    let verbose = human(root, &["status", "-v"]);
+    assert!(verbose.contains("Unstaged changes:"));
+    assert!(verbose.contains("Untracked files:\n  ?  notes.txt"));
+    assert!(verbose.contains("[unstaged modified]"));
     assert!(unstaged.contains("unstaged edits are not included in dependency checks"));
     assert_eq!(ok(root, &["status"])["requirements_satisfied"], true);
 
     ok(root, &["add", "pipe.step"]);
     let staged = human(root, &["status"]);
-    assert!(staged.contains("Staged changes:"));
-    assert!(staged.contains("[staged]"));
+    assert!(staged.contains("1 staged · 0 unstaged"));
+    let verbose = human(root, &["status", "--verbose"]);
+    assert!(verbose.contains("Staged changes:"));
+    assert!(verbose.contains("[staged]"));
     assert!(staged.contains("[REVISION MISMATCH]"));
     assert!(staged.contains("1 conflict"));
     assert!(staged.contains("unsatisfied requirements block ordinary commits"));
@@ -569,7 +579,8 @@ fn graph_renders_shared_dependencies_once_and_missing_targets_explicitly() {
     ok(root, &["rm", "pipe.step"]);
     let missing = human(root, &["status"]);
     assert_eq!(missing.matches("[MISSING ASSET]").count(), 2);
-    assert!(missing.contains("3 tracked files · 2 dependencies · 2 conflicts"));
+    assert!(missing.contains("Files: 3 tracked"));
+    assert!(missing.contains("Dependencies: 0 satisfied · 2 conflicts"));
 }
 
 #[test]
@@ -1078,4 +1089,371 @@ fn dependency_paths_and_definition_files_work_from_subdirectories() {
     );
     ok(root, &["commit", "-m", "Declared interface"]);
     ok(root, &["fsck"]);
+}
+
+fn wait_for_endpoint_exit(child: &mut std::process::Child) {
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        if std::time::Instant::now() >= limit {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("endpoint failed to enforce its I/O deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stalled_endpoint_io_releases_locks_and_rolls_back_partial_uploads() {
+    use knot_core::{Backend, ObjectKind, Repository, object_header, object_id};
+    use knot_store::FsBackend;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    for mode in [
+        "idle",
+        "partial-control",
+        "partial-upload",
+        "blocked-output",
+    ] {
+        let dir = tempdir().unwrap();
+        let backend = FsBackend::init_bare(dir.path(), None).unwrap();
+        let retained = backend
+            .put_object(ObjectKind::Blob, &vec![7; 1024 * 1024])
+            .unwrap();
+        let existing = backend.list_objects().unwrap();
+        drop(backend);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_knot"));
+        command
+            .arg("-C")
+            .arg(dir.path())
+            .args(["serve", "--stdio", "--idle-timeout", "1"]);
+        if mode == "partial-upload" {
+            command.arg("--allow-writes");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let input = child.stdin.as_mut().unwrap();
+        match mode {
+            "idle" => {
+                input.write_all(b"{\"operation\":\"advertise\"}\n").unwrap();
+                input.flush().unwrap();
+                let mut reply = String::new();
+                output.read_line(&mut reply).unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["ok"], true);
+            }
+            "partial-control" => {
+                input.write_all(b"{\"operation\":").unwrap();
+            }
+            "partial-upload" => {
+                let payload = b"new object rolled back after timeout";
+                let id = object_id(ObjectKind::Blob, payload);
+                let mut raw = object_header(ObjectKind::Blob, payload.len() as u64);
+                raw.extend_from_slice(payload);
+                let request = json!({"operation":"put","objects":[{"id":id,"len":raw.len()},{"id":retained,"len":100}],"updates":[]});
+                writeln!(input, "{request}").unwrap();
+                input.flush().unwrap();
+                let mut ready = String::new();
+                output.read_line(&mut ready).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&ready).unwrap()["data"]["ready"],
+                    true
+                );
+                input.write_all(&raw).unwrap();
+                input.write_all(b"knot\0").unwrap();
+            }
+            "blocked-output" => {
+                writeln!(input, "{}", json!({"operation":"get","objects":[retained]})).unwrap();
+                // Keep stdout open but deliberately do not drain its pipe.
+            }
+            _ => unreachable!(),
+        }
+        input.flush().unwrap();
+        wait_for_endpoint_exit(&mut child);
+        let repo = Repository::open(FsBackend::open(dir.path()).unwrap()).unwrap();
+        assert_eq!(repo.backend().list_objects().unwrap(), existing, "{mode}");
+        assert!(repo.backend().read_meta("incoming.json").unwrap().is_none());
+        repo.fsck().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stalled_ssh_peer_times_out_and_releases_the_local_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("project");
+    fs::create_dir(&root).unwrap();
+    ok(&root, &["init"]);
+    ok(
+        &root,
+        &["remote", "add", "origin", "ssh://review@unused/peer"],
+    );
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("-C")
+        .arg(&root)
+        .args(["--json", "fetch"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("KNOT_SYNC_IDLE_TIMEOUT_SECONDS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_endpoint_exit(&mut child);
+    let result = child.wait_with_output().unwrap();
+    let reply: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(reply["ok"], false);
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("progress timeout"),
+        "{reply}; stderr={}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    ok(&root, &["status"]);
+    ok(&root, &["fsck"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_pipe_transport_streams_frames_and_quotes_literal_repository_paths() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    ok(&source, &["init"]);
+    let content = vec![7; 128 * 1024 + 3];
+    fs::write(source.join("part"), &content).unwrap();
+    ok(&source, &["add", "."]);
+    ok(&source, &["commit", "-m", "Initial"]);
+    let peer = dir.path().join("peer'$(printf injected);");
+    ok(dir.path(), &["init", peer.to_str().unwrap(), "--bare"]);
+    let url = format!("ssh://review@unused{}", peer.display());
+    ok(&source, &["remote", "add", "origin", &url]);
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor argument do command=$argument; done\nexec /bin/sh -c \"$command\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![
+        bin,
+        Path::new(env!("CARGO_BIN_EXE_knot"))
+            .parent()
+            .unwrap()
+            .to_owned(),
+    ];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let network = |args: &[&str]| {
+        let result = Command::new(env!("CARGO_BIN_EXE_knot"))
+            .arg("-C")
+            .arg(&source)
+            .arg("--json")
+            .args(args)
+            .env("PATH", &path)
+            .env("KNOT_SYNC_IDLE_TIMEOUT_SECONDS", "5")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    network(&["push"]);
+    let copy = dir.path().join("copy");
+    network(&["clone", &url, copy.to_str().unwrap()]);
+    assert_eq!(fs::read(copy.join("part")).unwrap(), content);
+    ok(&copy, &["fsck"]);
+}
+
+#[test]
+fn concise_status_and_validation_count_checks_and_keep_failures_visible() {
+    use knot_core::{Repository, ReviewOutcome};
+    use knot_store::FsBackend;
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let repo = Repository::open(FsBackend::init(root, None).unwrap()).unwrap();
+    for name in [
+        "passed-part",
+        "stale-part",
+        "failed-part",
+        "error-part",
+        "procedure.md",
+    ] {
+        fs::write(root.join(name), "original").unwrap();
+    }
+    for n in 0..64 {
+        fs::write(root.join(format!("healthy-{n:03}")), "unchanged").unwrap();
+    }
+    repo.add(&[".".into()]).unwrap();
+    repo.define_test(
+        "pending-bench",
+        "procedure.md",
+        &["passed-part".into()],
+        "Fixture check",
+    )
+    .unwrap();
+    repo.commit("Baseline").unwrap();
+    for (asset, outcome, note) in [
+        (
+            "passed-part",
+            ReviewOutcome::Passed,
+            "Measured successfully".to_owned(),
+        ),
+        (
+            "stale-part",
+            ReviewOutcome::Passed,
+            "Previous measurement".to_owned(),
+        ),
+        ("failed-part", ReviewOutcome::Failed, "f".repeat(400)),
+        (
+            "error-part",
+            ReviewOutcome::Error,
+            "Fixture error\nretry\u{1b}[31m".to_owned(),
+        ),
+    ] {
+        repo.record_review(
+            repo.review_subject(asset, None).unwrap(),
+            outcome,
+            "Fixture reviewer",
+            &note,
+            "test fixture",
+            &[],
+        )
+        .unwrap();
+    }
+    fs::write(root.join("stale-part"), "changed").unwrap();
+    repo.add(&["stale-part".into()]).unwrap();
+    fs::write(root.join("fresh-untracked"), "new").unwrap();
+    drop(repo);
+    let before = ok(root, &["status"]);
+    let summary = human(root, &["status"]);
+    assert!(
+        summary.contains("Verification: 1 verified · 1 unverified · 1 stale · 1 failed · 1 error"),
+        "{summary}"
+    );
+    assert!(summary.contains("1 staged · 0 unstaged · 1 untracked"));
+    assert!(summary.contains("[FAILED] failed-part"));
+    assert!(summary.contains("[ERROR] error-part"));
+    assert!(summary.contains("Fixture error\\nretry\\u{1b}[31m"));
+    assert!(!summary.contains('\u{1b}'));
+    for hidden in [
+        "healthy-",
+        "passed-part",
+        "stale-part",
+        "pending-bench",
+        "fresh-untracked",
+    ] {
+        assert!(!summary.contains(hidden), "{summary}");
+    }
+    assert!(!summary.contains(&"f".repeat(400)));
+    assert!(summary.lines().count() < 20, "{summary}");
+    let verbose = human(root, &["status", "-v"]);
+    for shown in [
+        "healthy-000",
+        "healthy-063",
+        "[verified] passed-part",
+        "[STALE] stale-part",
+        "[unverified] pending-bench",
+        "fresh-untracked",
+    ] {
+        assert!(verbose.contains(shown), "missing {shown}: {verbose}");
+    }
+    assert!(verbose.contains(&"f".repeat(400)));
+    assert_eq!(human(root, &["-v", "status"]), verbose);
+    assert_eq!(ok(root, &["status", "--verbose"]), before);
+    assert_eq!(ok(root, &["validate"]), before["verification"]);
+    assert_eq!(ok(root, &["validate", "-v"]), before["verification"]);
+    let validation = human(root, &["validate"]);
+    assert!(validation.contains("[FAILED] failed-part"));
+    assert!(validation.contains("[ERROR] error-part"));
+    assert!(!validation.contains("passed-part"));
+    assert!(!validation.contains("stale-part"));
+    let validation_verbose = human(root, &["validate", "--verbose"]);
+    assert!(validation_verbose.contains("[verified] passed-part"));
+    assert!(validation_verbose.contains("[STALE] stale-part"));
+}
+
+#[test]
+fn history_issue_lists_and_checkout_are_concise_with_full_verbose_details() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    ok(root, &["init", "--author", "Fixture author"]);
+    fs::write(root.join("part"), "initial").unwrap();
+    ok(root, &["add", "."]);
+    ok(
+        root,
+        &[
+            "commit",
+            "-m",
+            "Design summary\n\nLong engineering explanation",
+        ],
+    );
+    let log = ok(root, &["log"]);
+    let concise = human(root, &["log"]);
+    assert!(concise.contains("Design summary"));
+    assert!(!concise.contains("Long engineering explanation"));
+    assert!(!concise.contains("Author:"));
+    let verbose = human(root, &["log", "-v"]);
+    assert!(verbose.contains("Author: Fixture author"));
+    assert!(verbose.contains("Long engineering explanation"));
+    assert_eq!(ok(root, &["log", "-v"]), log);
+    let issue = ok(
+        root,
+        &[
+            "issue",
+            "create",
+            "--title",
+            "Check clearance",
+            "--body",
+            "Detailed issue body",
+        ],
+    );
+    let id = issue["id"].as_str().unwrap();
+    ok(
+        root,
+        &[
+            "issue",
+            "comment",
+            id,
+            "--body",
+            "Detailed measurement comment",
+        ],
+    );
+    let issues = ok(root, &["issue", "list"]);
+    let concise = human(root, &["issue", "list"]);
+    assert!(concise.contains("[open] Check clearance"));
+    assert!(!concise.contains("Detailed issue body"));
+    assert!(!concise.contains("Detailed measurement comment"));
+    let verbose = human(root, &["issue", "list", "-v"]);
+    assert!(verbose.contains("Detailed issue body"));
+    assert!(verbose.contains("Detailed measurement comment"));
+    assert_eq!(ok(root, &["issue", "list", "-v"]), issues);
+    let concise = human(root, &["checkout", "HEAD"]);
+    assert!(concise.contains("Working tree clean"));
+    assert!(!concise.contains("part"));
+    let verbose = human(root, &["checkout", "HEAD", "--verbose"]);
+    assert!(verbose.contains("#1 part @"));
 }

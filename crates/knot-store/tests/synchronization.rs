@@ -459,3 +459,126 @@ fn compare_and_swap_and_immutable_references_are_enforced() {
     );
     assert_eq!(repo.resolve("v1").unwrap(), first);
 }
+
+#[test]
+fn proposed_issue_histories_are_replayed_before_refs_are_published() {
+    for new_issue in [false, true] {
+        for close in [false, true] {
+            let dir = tempdir().unwrap();
+            let source =
+                Repository::open(FsBackend::init(dir.path().join("source"), None).unwrap())
+                    .unwrap();
+            let peer =
+                Repository::open(FsBackend::init_bare(dir.path().join("peer"), None).unwrap())
+                    .unwrap();
+            let mut issue = source
+                .create_issue("Review fit", "Measure clearance")
+                .unwrap();
+            if close {
+                issue = source
+                    .update_issue(&issue.id.to_string(), IssueAction::Close, None)
+                    .unwrap();
+            }
+            let name = format!("refs/issues/{}", issue.id);
+            let mut bytes = Vec::new();
+            for id in source.backend().list_objects().unwrap() {
+                bytes.clear();
+                source.backend().export_object(&id, &mut bytes).unwrap();
+                peer.backend()
+                    .import_object(&id, bytes.len() as u64, &mut Cursor::new(&bytes))
+                    .unwrap();
+            }
+            if !new_issue {
+                peer.publish_references(
+                    &[ReferenceUpdate {
+                        name: name.clone(),
+                        before: None,
+                        after: issue.head.clone(),
+                    }],
+                    None,
+                    false,
+                )
+                .unwrap();
+            }
+            let refs = peer.reference_inventory().unwrap();
+            let mut event = source.load::<IssueEvent>(&issue.head).unwrap();
+            event.parent = Some(issue.head.clone());
+            event.action = if close {
+                IssueAction::Close
+            } else {
+                IssueAction::Reopen
+            };
+            let payload = canonical(&event).unwrap();
+            let id = object_id(ObjectKind::IssueEvent, &payload);
+            let update = ReferenceUpdate {
+                name,
+                before: (!new_issue).then_some(issue.head),
+                after: id.clone(),
+            };
+            let mut raw = object_header(ObjectKind::IssueEvent, payload.len() as u64);
+            raw.extend_from_slice(&payload);
+            let mut input = serde_json::to_vec(&serde_json::json!({"operation":"put", "objects":[{"id":id,"len":raw.len()}],"updates":[update]})).unwrap();
+            input.push(b'\n');
+            input.extend_from_slice(&raw);
+            let mut output = Vec::new();
+            serve_repository(&peer, &mut Cursor::new(input), &mut output, true).unwrap();
+            let replies: Vec<serde_json::Value> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(replies[0]["data"]["ready"], true);
+            assert_eq!(replies[1]["ok"], false);
+            assert_eq!(replies[1]["error"]["code"], "integrity_failure");
+            assert_eq!(peer.reference_inventory().unwrap(), refs);
+            assert!(
+                !peer
+                    .backend()
+                    .read_meta("transaction.json")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(peer.publish_references(&[update], None, false).is_err());
+            assert_eq!(peer.reference_inventory().unwrap(), refs);
+            peer.fsck().unwrap();
+        }
+    }
+}
+
+#[test]
+fn push_uses_committed_state_without_inspecting_source_worktree() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("source");
+    let peer_path = dir.path().join("peer");
+    drop(FsBackend::init_bare(&peer_path, None).unwrap());
+    let source = Repository::open(FsBackend::init(&source_path, None).unwrap()).unwrap();
+    source.write_asset("part", b"committed").unwrap();
+    source.commit("Initial").unwrap();
+    remote_add(&source, "origin", peer_path.to_str().unwrap()).unwrap();
+    // A symlink is not portable worktree input, but it is outside the pushed state.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("part", source_path.join("untracked-link")).unwrap();
+    // A non-NFC untracked name proves the same property on every platform.
+    fs::write(source_path.join("untracked.e\u{301}"), "unrelated").unwrap();
+    fs::write(source_path.join("part"), "unstaged edits").unwrap();
+    push(&source, "origin", Some("main")).unwrap();
+    push(&source, "origin", None).unwrap();
+    // Checkout the same commit without consulting the intentionally invalid worktree.
+    let head = source.head_id().unwrap().unwrap();
+    source
+        .backend()
+        .write_meta("HEAD", Some(&format!("{head}\n")))
+        .unwrap();
+    assert!(matches!(
+        push(&source, "origin", None),
+        Err(Error::Invalid(_))
+    ));
+    push(&source, "origin", Some("main")).unwrap();
+    let peer = Repository::open(FsBackend::open(&peer_path).unwrap()).unwrap();
+    assert_eq!(peer.head_id().unwrap(), Some(head));
+    assert_eq!(
+        fs::read(source_path.join("part")).unwrap(),
+        b"unstaged edits"
+    );
+    peer.fsck().unwrap();
+}
