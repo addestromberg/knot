@@ -296,7 +296,7 @@ impl<B: Backend> Repository<B> {
         Ok(Some(manifest.object))
     }
     pub fn tests_in_snapshot(&self, snapshot: &ObjectId) -> Result<Vec<NamedTest>> {
-        let graph = self.graph_snapshot(snapshot)?;
+        let graph = self.checked_graph(snapshot)?;
         let mut out = Vec::new();
         let mut names = BTreeSet::new();
         for node in &graph.nodes {
@@ -367,21 +367,20 @@ impl<B: Backend> Repository<B> {
         Ok((inputs, requirements))
     }
     pub fn verify_validation_record(&self, record: &ValidationRecord) -> Result<()> {
+        let _reads = self.read_scope();
         record.validate()?;
         for (asset, revision) in &record.inputs {
             if self.load::<Revision>(revision)?.asset != *asset {
                 return Err(Error::Integrity("review input identity mismatch".into()));
             }
         }
-        if let Some(snapshot) = &record.override_snapshot {
-            self.tree(snapshot)?;
-            if record.outcome != ReviewOutcome::Passed
-                || !matches!(record.subject, ReviewSubject::Dependency { .. })
-            {
-                return Err(Error::Integrity(
-                    "only accepted dependency overrides may bind an override snapshot".into(),
-                ));
-            }
+        if record.override_snapshot.is_some()
+            && (record.outcome != ReviewOutcome::Passed
+                || !matches!(record.subject, ReviewSubject::Dependency { .. }))
+        {
+            return Err(Error::Integrity(
+                "only accepted dependency overrides may bind an override snapshot".into(),
+            ));
         }
         for id in &record.requirements {
             self.verify_dependency(&self.load::<Dependency>(id)?)?;
@@ -487,7 +486,7 @@ impl<B: Backend> Repository<B> {
             }
         }
         if let Some(snapshot) = &record.override_snapshot {
-            let graph = self.graph_snapshot(snapshot)?;
+            let graph = self.checked_graph(snapshot)?;
             let (inputs, requirements) = self.review_inputs(&graph, &record.subject)?;
             if record.inputs != inputs || record.requirements != requirements {
                 return Err(Error::Integrity(
@@ -537,6 +536,7 @@ impl<B: Backend> Repository<B> {
         subject: ReviewSubject,
         details: ReviewDetails,
     ) -> Result<ObjectId> {
+        let _reads = self.read_scope();
         let ReviewDetails {
             outcome,
             reviewer,
@@ -622,6 +622,7 @@ impl<B: Backend> Repository<B> {
         &self,
         subject: &ReviewSubject,
     ) -> Result<Vec<(ObjectId, ValidationRecord)>> {
+        let _reads = self.read_scope();
         let mut next = self
             .backend
             .read_meta(&review_ref(subject)?)?
@@ -691,6 +692,7 @@ impl<B: Backend> Repository<B> {
         })
     }
     pub fn verification_snapshot(&self, graph: &GraphReport) -> Result<VerificationReport> {
+        let _reads = self.read_scope();
         let mut dependencies = Vec::new();
         let mut pairs = BTreeSet::new();
         for edge in &graph.edges {
@@ -759,6 +761,7 @@ impl<B: Backend> Repository<B> {
         })
     }
     pub fn verification(&self, at: Option<&str>) -> Result<VerificationReport> {
+        let _reads = self.read_scope();
         self.verification_snapshot(&self.graph(at)?)
     }
 
@@ -769,6 +772,7 @@ impl<B: Backend> Repository<B> {
         reviewer: &str,
         notes: &str,
     ) -> Result<Vec<ObjectId>> {
+        let _reads = self.read_scope();
         self.ensure_ready()?;
         if reviewer.trim().is_empty() || notes.trim().is_empty() {
             return Err(Error::Invalid(
@@ -787,7 +791,11 @@ impl<B: Backend> Repository<B> {
             }
         }
         let mut owners: BTreeSet<_> = accepted.iter().map(|(owner, _)| owner.clone()).collect();
-        for asset in accepted.iter().flat_map(|(owner, target)| [owner, target]) {
+        let assets: BTreeSet<_> = accepted
+            .iter()
+            .flat_map(|(owner, target)| [owner, target])
+            .collect();
+        for asset in assets {
             let node = graph
                 .nodes
                 .iter()
@@ -829,33 +837,107 @@ impl<B: Backend> Repository<B> {
             owners.remove(&ready);
             order.push(ready);
         }
+        if accepted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tree = self.tree(&graph.snapshot)?;
+        let mut selected: BTreeMap<_, _> = graph
+            .nodes
+            .iter()
+            .map(|n| (n.asset.clone(), n.revision.clone()))
+            .collect();
+        let mut baseline = BTreeMap::new();
+        for id in self.head_tree()?.values() {
+            let revision = self.load::<Revision>(id)?;
+            baseline.insert(revision.asset.clone(), (id.clone(), revision));
+        }
         for owner in order {
+            let node = graph
+                .nodes
+                .iter()
+                .find(|n| n.asset == owner)
+                .ok_or_else(|| Error::Integrity("override owner absent".into()))?;
+            let mut revision = self.load::<Revision>(&selected[&owner])?;
             for edge in graph.edges.iter().filter(|e| {
                 e.dependent == owner && accepted.contains(&(e.dependent.clone(), e.target.clone()))
             }) {
-                let request = match &edge.requirement {
+                let requirement = match &edge.requirement {
                     DependencyRequirement::Interface { name, .. } => {
-                        DependencyRequest::Interface(name.clone())
+                        DependencyRequirement::Interface {
+                            name: name.clone(),
+                            interface: edge.selected_interface.clone().ok_or_else(|| {
+                                Error::Conflict("missing override interface".into())
+                            })?,
+                        }
                     }
-                    _ => DependencyRequest::Revision(None),
+                    _ => DependencyRequirement::Revision {
+                        revision: selected[&edge.target].clone(),
+                    },
                 };
-                self.add_dependency(owner.as_str(), edge.target.as_str(), request)?;
+                let dependency = Dependency {
+                    dependent: owner.clone(),
+                    target: edge.target.clone(),
+                    requirement,
+                };
+                let mut retained = Vec::new();
+                for id in &revision.dependencies {
+                    let old = self.load::<Dependency>(id)?;
+                    if old.target != dependency.target
+                        || old.requirement.name() != dependency.requirement.name()
+                    {
+                        retained.push(id.clone());
+                    }
+                }
+                retained.push(self.put(&dependency)?);
+                revision.dependencies = retained;
             }
+            let id = self.save_revision(revision, baseline.remove(&owner))?;
+            tree.insert(node.path.clone(), id.clone());
+            selected.insert(owner, id);
+        }
+        let snapshot = self.save_tree(&tree)?;
+        let final_graph = self.graph_snapshot(&snapshot)?;
+        let mut tx = Transaction::new("override dependency reviews");
+        if snapshot != graph.snapshot {
+            tx.metadata
+                .push(self.meta_change("index", Some(pointer(&snapshot)))?);
         }
         let mut records = Vec::new();
+        let mut updates = BTreeMap::new();
         for subject in subjects {
-            records.push(self.record_review_details(
-                subject.clone(),
-                ReviewDetails {
-                    outcome: ReviewOutcome::Passed,
-                    reviewer: reviewer.into(),
-                    notes: notes.into(),
-                    environment: "operator override; no engineering test claimed".into(),
-                    artifacts: vec![],
-                    overridden: true,
-                },
-            )?);
+            let name = review_ref(subject)?;
+            let change = updates
+                .entry(name.clone())
+                .or_insert(self.meta_change(&name, None)?);
+            let parent = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .map(|s| parse_pointer(s))
+                .transpose()?;
+            let (inputs, requirements) = self.review_inputs(&final_graph, subject)?;
+            let now = timestamp()?;
+            let record = ValidationRecord {
+                subject: subject.clone(),
+                parent,
+                inputs,
+                requirements,
+                outcome: ReviewOutcome::Passed,
+                reviewer: reviewer.into(),
+                notes: notes.into(),
+                environment: "operator override; no engineering test claimed".into(),
+                artifacts: vec![],
+                started: now.clone(),
+                finished: now,
+                override_snapshot: Some(snapshot.clone()),
+            };
+            self.verify_validation_record(&record)?;
+            let id = self.put(&record)?;
+            change.after = Some(pointer(&id));
+            records.push(id);
         }
+        tx.metadata.extend(updates.into_values());
+        self.execute(tx)?;
         Ok(records)
     }
 

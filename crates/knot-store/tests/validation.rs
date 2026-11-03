@@ -363,3 +363,128 @@ fn malformed_manifests_do_not_poison_history_and_incomplete_evidence_is_rejected
     release.evidence.clear();
     assert!(repo.verify_release(&release).is_err());
 }
+
+#[test]
+fn failed_bulk_override_preserves_staging_and_all_review_refs() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    for name in ["pipe", "rod", "assembly"] {
+        fs::write(dir.path().join(name), name).unwrap();
+    }
+    repo.add(&[".".into()]).unwrap();
+    repo.add_dependency("rod", "pipe", DependencyRequest::Revision(None))
+        .unwrap();
+    repo.add_dependency("assembly", "rod", DependencyRequest::Revision(None))
+        .unwrap();
+    repo.commit("Initial").unwrap();
+    let subjects: Vec<_> = repo
+        .verification(None)
+        .unwrap()
+        .dependencies
+        .into_iter()
+        .map(|e| e.subject)
+        .collect();
+    repo.override_dependency_reviews(&subjects, "Operator", "First override")
+        .unwrap();
+    let before = repo.backend().read_meta("index").unwrap();
+    let refs: Vec<_> = subjects
+        .iter()
+        .map(|s| {
+            let name = review_ref(s).unwrap();
+            let value = repo.backend().read_meta(&name).unwrap();
+            (name, value)
+        })
+        .collect();
+    fs::write(dir.path().join("pipe"), "unstaged").unwrap();
+    assert!(matches!(
+        repo.override_dependency_reviews(&subjects, "Operator", "Must fail"),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(repo.backend().read_meta("index").unwrap(), before);
+    for (name, value) in refs {
+        assert_eq!(repo.backend().read_meta(&name).unwrap(), value);
+    }
+    assert!(
+        repo.backend()
+            .read_meta("transaction.json")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn bulk_override_rebinds_mixed_contracts_against_final_revisions() {
+    let dir = tempdir().unwrap();
+    let repo = Repository::open(FsBackend::init(dir.path(), None).unwrap()).unwrap();
+    for name in ["pipe", "rod", "assembly", "contract"] {
+        fs::write(dir.path().join(name), name).unwrap();
+    }
+    repo.add(&[".".into()]).unwrap();
+    repo.set_interface("rod", "fit", "contract").unwrap();
+    repo.add_dependency("rod", "pipe", DependencyRequest::Revision(None))
+        .unwrap();
+    repo.add_dependency(
+        "assembly",
+        "rod",
+        DependencyRequest::Interface("fit".into()),
+    )
+    .unwrap();
+    let pipe = repo
+        .graph(None)
+        .unwrap()
+        .nodes
+        .into_iter()
+        .find(|n| n.path == "pipe")
+        .unwrap()
+        .revision;
+    repo.add_dependency(
+        "assembly",
+        "pipe",
+        DependencyRequest::RevisionRange {
+            minimum: pipe,
+            maximum: None,
+        },
+    )
+    .unwrap();
+    repo.commit("Initial contracts").unwrap();
+    fs::write(dir.path().join("pipe"), "new pipe").unwrap();
+    fs::write(dir.path().join("contract"), "new interface").unwrap();
+    repo.add(&["pipe".into(), "contract".into()]).unwrap();
+    repo.set_interface("rod", "fit", "contract").unwrap();
+    let subjects: Vec<_> = repo
+        .verification(None)
+        .unwrap()
+        .dependencies
+        .into_iter()
+        .map(|e| e.subject)
+        .collect();
+    let records = repo
+        .override_dependency_reviews(&subjects, "Operator", "Accept selected inputs")
+        .unwrap();
+    assert_eq!(records.len(), 3);
+    let graph = repo.graph(None).unwrap();
+    assert!(graph.requirements_satisfied);
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|e| !matches!(e.requirement, DependencyRequirement::RevisionRange { .. }))
+    );
+    assert_eq!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| matches!(e.requirement, DependencyRequirement::Interface { .. }))
+            .count(),
+        1
+    );
+    for id in records {
+        let record = repo.load::<ValidationRecord>(&id).unwrap();
+        assert_eq!(record.override_snapshot, Some(graph.snapshot.clone()));
+        assert!(
+            repo.record_covers_snapshot(&record, &graph.snapshot)
+                .unwrap()
+        );
+    }
+    repo.fsck().unwrap();
+}

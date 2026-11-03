@@ -80,6 +80,17 @@ alter test-result history. Missing assets/interfaces and impossible revision-pin
 cycles require explicit graph repair; the command cannot invent a selected target.
 Stage relevant working edits first. Earlier accepted records are never erased.
 
+Accepted overrides are prepared against one final snapshot. Each distinct input
+file is hashed once; staging and all accepted review refs are published together
+through one recovery journal. An interruption before publication leaves the old
+refs intact. If a journal remains, use `knot recover --continue` to complete
+publication or `knot recover --abort` to restore the previous staging and reviews.
+Once the completion log is durable, recovery must complete rather than abort.
+
+Status and review operations reuse checked immutable objects, snapshots, and graphs
+only within that operation, with bounded memory. Subsequent commands check them
+afresh; working-file contents and mutable review refs are not cached across calls.
+
 ## Traceability and release policies
 
 ```sh
