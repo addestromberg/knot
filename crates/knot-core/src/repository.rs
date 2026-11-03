@@ -1,8 +1,9 @@
 use crate::*;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     sync::{Arc, Mutex, MutexGuard},
+    thread::{self, ThreadId},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -11,7 +12,7 @@ pub(crate) type Tree = BTreeMap<String, ObjectId>;
 
 pub struct Repository<B: Backend> {
     pub(crate) backend: B,
-    reads: Mutex<Option<ReadCache>>,
+    reads: Mutex<HashMap<ThreadId, ReadCache>>,
 }
 
 // Reuse fully checked immutable snapshots only within a single operation. Never
@@ -32,14 +33,31 @@ struct CheckedObject {
 }
 
 pub(crate) struct ReadScope<'a> {
-    reads: &'a Mutex<Option<ReadCache>>,
+    reads: &'a Mutex<HashMap<ThreadId, ReadCache>>,
+    thread: ThreadId,
     owner: bool,
 }
 impl Drop for ReadScope<'_> {
     fn drop(&mut self) {
         if self.owner {
-            *self.reads.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.thread);
         }
+    }
+}
+
+pub(crate) struct ReadCacheAccess<'a> {
+    caches: MutexGuard<'a, HashMap<ThreadId, ReadCache>>,
+    thread: ThreadId,
+}
+impl ReadCacheAccess<'_> {
+    pub fn as_ref(&self) -> Option<&ReadCache> {
+        self.caches.get(&self.thread)
+    }
+    pub fn as_mut(&mut self) -> Option<&mut ReadCache> {
+        self.caches.get_mut(&self.thread)
     }
 }
 
@@ -152,7 +170,7 @@ impl<B: Backend> Repository<B> {
     pub fn open(backend: B) -> Result<Self> {
         let repo = Self {
             backend,
-            reads: Mutex::new(None),
+            reads: Mutex::new(HashMap::new()),
         };
         repo.head_value()?;
         repo.index_id()?;
@@ -162,19 +180,26 @@ impl<B: Backend> Repository<B> {
         &self.backend
     }
 
-    pub(crate) fn read_cache(&self) -> MutexGuard<'_, Option<ReadCache>> {
+    pub(crate) fn read_cache(&self) -> ReadCacheAccess<'_> {
         // Only successfully checked immutable data is cached.
-        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+        ReadCacheAccess {
+            caches: self.reads.lock().unwrap_or_else(|e| e.into_inner()),
+            thread: thread::current().id(),
+        }
     }
 
     pub(crate) fn read_scope(&self) -> ReadScope<'_> {
         let mut reads = self.read_cache();
-        let owner = reads.is_none();
-        if owner {
-            *reads = Some(ReadCache::default());
-        }
+        // Nested synchronous helpers share trust; calls on other threads do not.
+        let owner = if let Entry::Vacant(entry) = reads.caches.entry(reads.thread) {
+            entry.insert(ReadCache::default());
+            true
+        } else {
+            false
+        };
         ReadScope {
             reads: &self.reads,
+            thread: reads.thread,
             owner,
         }
     }
