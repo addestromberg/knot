@@ -82,7 +82,21 @@ Graph statuses are:
 
 `status` reports `requirements_satisfied` and `dependency_conflicts`; staged diffs identify `constraints` and `interfaces` changes even when bytes are identical. Staging is permitted to be incomplete. Default commit and checkout reject unsatisfied requirements. JSON errors use exit 3, `dependency_conflict`, and `details.conflicts` with source, target, expected requirement, actual selection, and status.
 
-Human-readable `status` also displays staged/unstaged/untracked changes and the complete staged dependency tree. Parent nodes depend on child nodes; each asset is expanded once, with numbered references for shared dependencies and cycles. Nodes show the selected revision and change markers. Edges show the required revision or named interface and whether it matches, including missing targets/exports and mismatches. Disconnected files are included. Unstaged edits produce an explicit warning and do not silently change the graph. `graph` uses the same renderer for staged or historical views. JSON status includes the full report as `dependency_graph` while preserving existing fields; status also includes a separate `verification` report for M4 evidence; graph matches alone do not establish verification.
+Human-readable `status` summarizes file/change counts, satisfied requirements and
+conflicts, and verification states. Dependency conflicts and failed/error checks
+remain individually visible; unverified/stale checks and upstream review needs
+are counted. `status --verbose` lists staged/unstaged/untracked paths, the complete
+staged dependency tree, and all verification entries. Parent nodes depend on child
+nodes; each asset is expanded once, with numbered references for shared
+dependencies and cycles. Nodes show the selected revision and change markers.
+Edges show the required revision or named interface and whether it matches,
+including missing targets/exports and mismatches. Disconnected files are included
+in the verbose tree. Unstaged edits produce an explicit warning and do not
+silently change the graph. `graph` always uses the full renderer for staged or
+historical views. JSON status includes the full report as `dependency_graph`
+regardless of `--verbose`, while preserving existing fields; status also includes
+a separate `verification` report for M4 evidence. Graph matches alone do not
+establish engineering verification.
 
 `commit --allow-incompatible` explicitly records a WIP snapshot; `checkout --allow-incompatible` explicitly restores one. These overrides do not bypass content integrity, object ownership, recovery, or dirty-file protection. `fsck` checks structural integrity and can pass for an intentionally recorded incompatible configuration.
 

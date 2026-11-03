@@ -1,5 +1,6 @@
 use knot_core::{
-    Change, DependencyEdge, DependencyRequirement, GraphReport, ObjectId, RequirementStatus, Status,
+    Change, DependencyEdge, DependencyRequirement, GraphReport, ObjectId, RequirementStatus,
+    Status, VerificationEntry, VerificationReport, VerificationState,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,7 +28,7 @@ fn text(value: &str) -> String {
         .collect()
 }
 
-pub fn status(out: &mut impl Write, status: &Status) -> io::Result<()> {
+pub fn status(out: &mut impl Write, status: &Status, verbose: bool) -> io::Result<()> {
     match (&status.branch, &status.head) {
         (Some(branch), Some(head)) => {
             writeln!(out, "On branch {} · HEAD {}", text(branch), short(head))?;
@@ -43,9 +44,12 @@ pub fn status(out: &mut impl Write, status: &Status) -> io::Result<()> {
         )?;
     }
     writeln!(out)?;
-    if status.staged.is_empty() && status.unstaged.is_empty() && status.untracked.is_empty() {
+    let clean =
+        status.staged.is_empty() && status.unstaged.is_empty() && status.untracked.is_empty();
+    if clean {
         writeln!(out, "Working tree clean")?;
-    } else {
+    }
+    if verbose {
         changes(out, "Staged changes", &status.staged)?;
         changes(out, "Unstaged changes", &status.unstaged)?;
         if !status.untracked.is_empty() {
@@ -54,42 +58,141 @@ pub fn status(out: &mut impl Write, status: &Status) -> io::Result<()> {
                 writeln!(out, "  ?  {}", text(path))?;
             }
         }
-    }
-    writeln!(out)?;
-    graph_inner(out, &status.dependency_graph, Some(status))?;
-    if !status.verification.dependencies.is_empty()
-        || !status.verification.tests.is_empty()
-        || !status.verification.assets.is_empty()
-    {
-        writeln!(out, "\nVerification:")?;
-        for entry in status
-            .verification
-            .dependencies
+        writeln!(out)?;
+        graph_inner(out, &status.dependency_graph, Some(status))?;
+    } else {
+        let changed: BTreeSet<_> = status
+            .staged
             .iter()
-            .chain(&status.verification.tests)
-            .chain(&status.verification.assets)
+            .chain(&status.unstaged)
+            .map(|c| c.path.as_str())
+            .collect();
+        let unchanged = status
+            .dependency_graph
+            .nodes
+            .iter()
+            .filter(|n| !changed.contains(n.path.as_str()))
+            .count();
+        writeln!(
+            out,
+            "Files: {} tracked · {unchanged} unchanged · {} staged · {} unstaged · {} untracked",
+            status.dependency_graph.nodes.len(),
+            status.staged.len(),
+            status.unstaged.len(),
+            status.untracked.len()
+        )?;
+        if status.dependency_graph.nodes.is_empty() {
+            writeln!(out, "No tracked files. Use knot add <path> to stage files.")?;
+        }
+        let graph = &status.dependency_graph;
+        let conflicts = graph
+            .edges
+            .iter()
+            .filter(|e| e.status != RequirementStatus::Satisfied)
+            .count();
+        writeln!(
+            out,
+            "Dependencies: {} satisfied · {}",
+            graph.edges.len() - conflicts,
+            counted(conflicts, "conflict", "conflicts")
+        )?;
+        for edge in graph
+            .edges
+            .iter()
+            .filter(|e| e.status != RequirementStatus::Satisfied)
         {
-            let label = match entry.state {
-                knot_core::VerificationState::Verified => {
-                    if entry.overridden {
-                        "verified (raped)"
-                    } else {
-                        "verified"
-                    }
-                }
-                knot_core::VerificationState::Unverified => "unverified",
-                knot_core::VerificationState::Stale => "STALE",
-                knot_core::VerificationState::Failed => "FAILED",
-                knot_core::VerificationState::Error => "ERROR",
-            };
-            let target = entry
+            let target = edge
                 .target_path
                 .as_deref()
-                .map(|p| format!(" -> {}", text(p)))
-                .unwrap_or_default();
-            writeln!(out, "  [{label}] {}{target}", text(&entry.path))?;
+                .map(text)
+                .unwrap_or_else(|| format!("missing asset {}", short(&edge.target)));
+            writeln!(
+                out,
+                "  {} -> {target}{}",
+                text(&edge.dependent_path),
+                requirement(edge)
+            )?;
         }
-        for warning in &status.verification.upstream {
+        if conflicts > 0 {
+            writeln!(
+                out,
+                "WARNING: unsatisfied requirements block ordinary commits."
+            )?;
+        }
+    }
+    verification_inner(out, &status.verification, verbose)?;
+    if !status.unstaged.is_empty() {
+        writeln!(
+            out,
+            "WARNING: unstaged edits are not included in dependency checks; stage them with knot add."
+        )?;
+    }
+    if !verbose {
+        writeln!(
+            out,
+            "Use knot status --verbose for paths, the full graph, and verification details."
+        )?;
+    }
+    Ok(())
+}
+
+fn verification_inner(
+    out: &mut impl Write,
+    report: &VerificationReport,
+    verbose: bool,
+) -> io::Result<()> {
+    let mut counts = [0; 5];
+    let mut overridden = 0;
+    for entry in report
+        .dependencies
+        .iter()
+        .chain(&report.tests)
+        .chain(&report.assets)
+    {
+        counts[match entry.state {
+            VerificationState::Verified => 0,
+            VerificationState::Unverified => 1,
+            VerificationState::Stale => 2,
+            VerificationState::Failed => 3,
+            VerificationState::Error => 4,
+        }] += 1;
+        if entry.state == VerificationState::Verified && entry.overridden {
+            overridden += 1;
+        }
+    }
+    if counts.iter().all(|n| *n == 0) {
+        writeln!(out, "Verification: no reviews or tests")?;
+    } else {
+        writeln!(
+            out,
+            "Verification: {} verified · {} unverified · {} stale · {} failed · {}",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counted(counts[4], "error", "errors")
+        )?;
+    }
+    if overridden > 0 {
+        writeln!(out, "  {overridden} verified (raped) by operator override")?;
+    }
+    for entry in report
+        .dependencies
+        .iter()
+        .chain(&report.tests)
+        .chain(&report.assets)
+    {
+        if verbose
+            || matches!(
+                entry.state,
+                VerificationState::Failed | VerificationState::Error
+            )
+        {
+            verification_entry(out, entry, verbose)?;
+        }
+    }
+    if verbose {
+        for warning in &report.upstream {
             writeln!(
                 out,
                 "  [unverified upstream] {} — dependency {} -> {} needs review",
@@ -98,14 +201,82 @@ pub fn status(out: &mut impl Write, status: &Status) -> io::Result<()> {
                 short(&warning.target)
             )?;
         }
-    }
-    if !status.unstaged.is_empty() {
+    } else if !report.upstream.is_empty() {
+        let assets: BTreeSet<_> = report.upstream.iter().map(|w| &w.asset).collect();
         writeln!(
             out,
-            "WARNING: unstaged edits are not included in dependency checks; stage them with knot add."
+            "Upstream review needed: {}",
+            counted(assets.len(), "asset", "assets")
         )?;
     }
     Ok(())
+}
+
+fn verification_entry(
+    out: &mut impl Write,
+    entry: &VerificationEntry,
+    verbose: bool,
+) -> io::Result<()> {
+    let label = match entry.state {
+        VerificationState::Verified if entry.overridden => "verified (raped)",
+        VerificationState::Verified => "verified",
+        VerificationState::Unverified => "unverified",
+        VerificationState::Stale => "STALE",
+        VerificationState::Failed => "FAILED",
+        VerificationState::Error => "ERROR",
+    };
+    let target = entry
+        .target_path
+        .as_deref()
+        .map(|p| format!(" -> {}", text(p)))
+        .unwrap_or_default();
+    writeln!(out, "  [{label}] {}{target}", text(&entry.path))?;
+    if !entry.reason.is_empty() {
+        let reason = text(&entry.reason);
+        let clipped = !verbose && reason.chars().count() > 200;
+        let shown: String = reason
+            .chars()
+            .take(if verbose { usize::MAX } else { 200 })
+            .collect();
+        writeln!(out, "    {shown}{}", if clipped { "…" } else { "" })?;
+    }
+    Ok(())
+}
+
+pub fn verification(
+    out: &mut impl Write,
+    report: &VerificationReport,
+    verbose: bool,
+) -> io::Result<()> {
+    verification_inner(out, report, verbose)?;
+    if !verbose {
+        writeln!(
+            out,
+            "Use --verbose for individual checks and upstream review paths."
+        )?;
+    }
+    Ok(())
+}
+
+pub fn issues(out: &mut impl Write, issues: &[knot_core::Issue]) -> io::Result<()> {
+    if issues.is_empty() {
+        return writeln!(out, "No issues.");
+    }
+    writeln!(out, "{}:", counted(issues.len(), "issue", "issues"))?;
+    for issue in issues {
+        let prefix: String = issue.id.to_string().chars().take(8).collect();
+        writeln!(
+            out,
+            "  {} [{}] {}",
+            prefix,
+            text(&issue.status),
+            text(&issue.title)
+        )?;
+    }
+    writeln!(
+        out,
+        "Use --verbose for issue bodies, comments, links, and history."
+    )
 }
 
 fn changes(out: &mut impl Write, label: &str, changes: &[Change]) -> io::Result<()> {
@@ -122,7 +293,11 @@ pub fn graph(out: &mut impl Write, graph: &GraphReport) -> io::Result<()> {
     graph_inner(out, graph, None)
 }
 
-pub fn history(out: &mut impl Write, history: &[knot_core::HistoryEntry]) -> io::Result<()> {
+pub fn history(
+    out: &mut impl Write,
+    history: &[knot_core::HistoryEntry],
+    verbose: bool,
+) -> io::Result<()> {
     if history.is_empty() {
         writeln!(out, "No commits.")?;
     }
@@ -132,6 +307,16 @@ pub fn history(out: &mut impl Write, history: &[knot_core::HistoryEntry]) -> io:
         } else {
             " (raped)"
         };
+        if !verbose {
+            let subject = entry.commit.message.lines().next().unwrap_or_default();
+            writeln!(
+                out,
+                "{} {subject}{marker}",
+                short(&entry.id),
+                subject = text(subject)
+            )?;
+            continue;
+        }
         writeln!(out, "commit {}{marker}", entry.id)?;
         if let Some(author) = &entry.commit.author {
             writeln!(out, "Author: {}", text(author))?;
@@ -142,6 +327,9 @@ pub fn history(out: &mut impl Write, history: &[knot_core::HistoryEntry]) -> io:
             entry.commit.timestamp,
             text(&entry.commit.message)
         )?;
+    }
+    if !verbose && !history.is_empty() {
+        writeln!(out, "Use knot log --verbose for full commit details.")?;
     }
     Ok(())
 }
@@ -168,7 +356,12 @@ fn requirement(edge: &DependencyEdge) -> String {
         RequirementStatus::MissingInterface => "MISSING INTERFACE",
         RequirementStatus::InterfaceMismatch => "INTERFACE MISMATCH",
     };
-    let selected = if edge.status == RequirementStatus::InterfaceMismatch {
+    let selected = if edge.status == RequirementStatus::RevisionMismatch {
+        edge.selected_revision
+            .as_ref()
+            .map(|id| format!("; selected @{}", short(id)))
+            .unwrap_or_default()
+    } else if edge.status == RequirementStatus::InterfaceMismatch {
         edge.selected_interface
             .as_ref()
             .map(|id| format!("; selected interface @{}", short(id)))

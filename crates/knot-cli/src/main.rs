@@ -23,6 +23,9 @@ struct Cli {
     /// Emit a versioned JSON envelope.
     #[arg(long, global = true)]
     json: bool,
+    /// Show full paths, graphs, verification entries, and record details.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     /// Operate from this directory.
     #[arg(short = 'C', long, global = true, default_value = ".")]
     directory: PathBuf,
@@ -88,7 +91,7 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<String>,
     },
-    /// Show working changes and the staged dependency graph.
+    /// Summarize working state and verification; use --verbose for full listings.
     Status,
     Commit {
         #[arg(short, long)]
@@ -517,6 +520,8 @@ enum CommandOutput {
     Status(Box<Status>),
     Graph(GraphReport),
     History(Vec<knot_core::HistoryEntry>),
+    Verification(Box<knot_core::VerificationReport>),
+    Issues(Vec<knot_core::Issue>),
 }
 
 fn value<T: serde::Serialize>(item: T) -> Result<CommandOutput> {
@@ -840,7 +845,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
                         .tests
                         .retain(|t| t.state != knot_core::VerificationState::Verified);
                 }
-                value(report)
+                Ok(CommandOutput::Verification(Box::new(report)))
             }
         }
         Command::Tests { command } => match command {
@@ -957,7 +962,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
                 &title,
                 &body_value(&base, body, body_file)?.unwrap_or_default(),
             )?),
-            IssueCommand::List { all } => value(repo.list_issues(all)?),
+            IssueCommand::List { all } => Ok(CommandOutput::Issues(repo.list_issues(all)?)),
             IssueCommand::Show { id } => value(repo.issue(&id)?),
             IssueCommand::Edit {
                 id,
@@ -1029,15 +1034,20 @@ fn output(value: &Value, json_output: bool) -> std::io::Result<()> {
     writeln!(out)
 }
 
-fn success_output(data: CommandOutput, json_output: bool) -> std::io::Result<()> {
+fn success_output(data: CommandOutput, json_output: bool, verbose: bool) -> std::io::Result<()> {
     if json_output {
         return output(&json!({"schema_version":1,"ok":true,"data":data}), true);
     }
     let stdout = std::io::stdout();
     match data {
-        CommandOutput::Status(status) => display::status(&mut stdout.lock(), &status),
+        CommandOutput::Status(status) => display::status(&mut stdout.lock(), &status, verbose),
         CommandOutput::Graph(graph) => display::graph(&mut stdout.lock(), &graph),
-        CommandOutput::History(history) => display::history(&mut stdout.lock(), &history),
+        CommandOutput::History(history) => display::history(&mut stdout.lock(), &history, verbose),
+        CommandOutput::Verification(report) => {
+            display::verification(&mut stdout.lock(), &report, verbose)
+        }
+        CommandOutput::Issues(issues) if !verbose => display::issues(&mut stdout.lock(), &issues),
+        CommandOutput::Issues(issues) => output(&serde_json::to_value(issues)?, false),
         CommandOutput::Data(data) => output(&data, false),
     }
 }
@@ -1088,8 +1098,9 @@ fn main() -> ExitCode {
         };
     }
     let json_output = cli.json;
+    let verbose = cli.verbose;
     match run(cli) {
-        Ok(data) => match success_output(data, json_output) {
+        Ok(data) => match success_output(data, json_output, verbose) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
             Err(e) => {
